@@ -19,10 +19,16 @@ files:
 # owner/repo are injected by CI from the GitHub context (see
 # .github/workflows/release.yml: GH_OWNER / GH_REPO), so the feed automatically
 # points at whatever repository you push this app to — no manual edits needed.
+# releaseType: release -> publish installers straight to a normal, public
+# release. electron-builder defaults to `draft`, which silently SKIPS every
+# installer upload when a non-draft release already exists for the tag
+# ("existing type not compatible with publishing type") — leaving the download
+# feed empty even though the build succeeded.
 publish:
   provider: github
   owner: ${env.GH_OWNER}
   repo: ${env.GH_REPO}
+  releaseType: release
 
 win:
   target:
