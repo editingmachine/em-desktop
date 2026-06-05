@@ -1,0 +1,62 @@
+# Task #1742 — installer + auto-update configuration.
+appId: com.editingmachine.desktop
+productName: Editing Machine Sync
+copyright: Copyright © Editing Machine
+
+directories:
+  output: build
+  buildResources: assets
+
+# Ship the daemon + main + preload (JS) and the built renderer (Vite → src/renderer/dist).
+files:
+  - "src/main/**/*"
+  - "src/daemon/**/*"
+  - "src/preload/**/*"
+  - "src/renderer/dist/**/*"
+  - "package.json"
+
+# Auto-update feed — GitHub Releases of THIS repo.
+# owner/repo are injected by CI from the GitHub context (see
+# .github/workflows/release.yml: GH_OWNER / GH_REPO), so the feed automatically
+# points at whatever repository you push this app to — no manual edits needed.
+publish:
+  provider: github
+  owner: ${env.GH_OWNER}
+  repo: ${env.GH_REPO}
+
+win:
+  target:
+    - nsis
+  icon: assets/icon.ico
+  # Code-signing (set env before building):
+  #   CSC_LINK=path/to/cert.pfx  CSC_KEY_PASSWORD=...
+  # electron-builder picks these up automatically.
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+mac:
+  target:
+    - dmg
+    - zip
+  icon: assets/icon.icns
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # Notarization (set env before building):
+  #   APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+
+dmg:
+  title: Editing Machine Sync
+
+linux:
+  target:
+    - AppImage
+  icon: assets/icon.png
+  category: Utility

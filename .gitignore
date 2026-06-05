@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Renderer build output (Vite)
+src/renderer/dist/
+
+# electron-builder installer outputs.
+# NOTE: build/entitlements.mac.plist is committed and must stay tracked,
+# so we ignore generated artifacts individually rather than the whole dir.
+build/*.exe
+build/*.dmg
+build/*.zip
+build/*.AppImage
+build/*.blockmap
+build/*.yml
+build/*.yaml
+build/win-unpacked/
+build/mac/
+build/mac-arm64/
+build/linux-unpacked/

@@ -1,0 +1,93 @@
+# Builds the Editing Machine Sync desktop installers for macOS, Windows, and
+# Linux. Each installer is built on its own native runner (electron-builder
+# cannot cross-build a signed macOS .dmg or a Windows .exe from Linux), then
+# uploaded as a downloadable artifact on the workflow run.
+#
+# Trigger it two ways:
+#   - Manually:  Actions tab -> "Build desktop installers" -> Run workflow.
+#   - On a tag:  push a tag like `v1.0.1` and the installers build automatically.
+#
+# Code-signing is OPTIONAL and picked up from repo Secrets when present. Without
+# them the installers still build and run, but show a first-open security warning:
+#   - Windows: secrets CSC_LINK (base64 .pfx) + CSC_KEY_PASSWORD
+#   - macOS:   secrets APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID,
+#              plus CSC_LINK (base64 .p12) + CSC_KEY_PASSWORD
+name: Build desktop installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+# Let the built-in GITHUB_TOKEN create/publish the GitHub Release that the
+# auto-updater reads. Without this, publishing fails on repos whose default
+# token is read-only.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: macos-installer
+          - os: windows-latest
+            artifact: windows-installer
+          - os: ubuntu-latest
+            artifact: linux-installer
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build renderer
+        run: npm run build:renderer
+
+      # On a version tag (e.g. v1.0.1) -> publish a GitHub Release so the app's
+      # built-in auto-updater has a feed to check. On a manual run -> just build
+      # test installers (no release).
+      - name: Build installer
+        run: npx electron-builder --publish ${{ startsWith(github.ref, 'refs/tags/') && 'always' || 'never' }}
+        env:
+          # GitHub-provided token — lets electron-builder publish the release feed.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Point the auto-update feed at THIS repository automatically.
+          GH_OWNER: ${{ github.repository_owner }}
+          GH_REPO: ${{ github.event.repository.name }}
+          # Unsigned builds: stop macOS from trying to auto-sign with a random
+          # keychain identity. The installers still work; first open shows a
+          # one-time "unknown publisher" prompt.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          # --- Code signing (OPTIONAL) -------------------------------------
+          # When you're ready to remove the first-open warning, add the matching
+          # repo Secrets and uncomment the lines below. Leaving them commented
+          # avoids handing electron-builder empty values (which breaks the build).
+          #   Windows: CSC_LINK (base64 .pfx) + CSC_KEY_PASSWORD
+          #   macOS:   CSC_LINK (base64 .p12) + CSC_KEY_PASSWORD,
+          #            plus APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
+          # CSC_LINK: ${{ secrets.CSC_LINK }}
+          # CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          # Installer files only — skip the unpacked app dirs and blockmaps.
+          path: |
+            build/*.dmg
+            build/*.zip
+            build/*.exe
+            build/*.AppImage
+          if-no-files-found: warn
