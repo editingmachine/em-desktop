@@ -2,17 +2,21 @@
 //
 // The portal is the EXISTING web app loaded inside the desktop shell. This
 // preload exposes a single, read-only question on `window.emProxy`:
-//   "do you have a locally-synced all-intra proxy + keyframe index for this
-//    asset?" → returns a playable `em-proxy://` URL + the parsed sidecar, or
-//    null. The web side (client/src/lib/desktop-proxy-bridge.ts) treats every
-//    null as a clean "fall back to the HLS Quick preview" signal.
+//   "do you have a locally-synced scrub source for this asset?" → returns a
+//    playable `em-proxy://` URL, which derivative resolved, and the parsed
+//    keyframe-index sidecar (null for the all-intra source), or null. The web
+//    side (client/src/lib/desktop-proxy-bridge.ts) treats every null as a clean
+//    "fall back to the HLS Quick preview" signal.
 //
 // contextIsolation stays ON: nothing here leaks ipcRenderer or node into the
-// page — only the two flat fields the web bridge contract reads.
+// page — only the flat fields the web bridge contract reads.
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("emProxy", {
   isAvailable: true,
-  resolveLocalProxy: (assetId) =>
-    ipcRenderer.invoke("em-proxy:resolve", assetId),
+  // Task #1766 — preferred local scrub source (all-intra MP4 when synced,
+  // else the progressive proxy + keyframe index). Reports which source
+  // resolved so the preview monitor can show an honest indicator.
+  resolveLocalScrubSource: (assetId) =>
+    ipcRenderer.invoke("em-proxy:resolveScrubSource", assetId),
 });

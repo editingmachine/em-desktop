@@ -38,16 +38,21 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// assetId → absolute on-disk proxy path, populated by `em-proxy:resolve` so
-// the protocol handler never has to trust a renderer-supplied file path.
+// assetId/variant → absolute on-disk proxy path, populated by
+// `em-proxy:resolveScrubSource` so the protocol handler never has to trust a
+// renderer-supplied file path.
 const proxyPathByAssetId = new Map();
 
-function assetIdFromProxyUrl(rawUrl) {
-  // em-proxy://asset/<assetId>
+// Lookup key for `proxyPathByAssetId`. The Task #1766 scrub-source URL carries
+// a variant segment `em-proxy://asset/<id>/<variant>` (key `<id>/<variant>`) so
+// the all-intra and progressive files for the SAME asset never collide.
+function proxyKeyFromProxyUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
-    const id = Number((u.pathname || "").replace(/^\/+/, "").split("/")[0]);
-    return Number.isFinite(id) && id > 0 ? id : null;
+    const key = (u.pathname || "").replace(/^\/+/, "");
+    const id = Number(key.split("/")[0]);
+    if (!Number.isFinite(id) || id <= 0) return null;
+    return key;
   } catch (_) {
     return null;
   }
@@ -69,7 +74,15 @@ let engine = null;
 let isQuitting = false;
 
 function assetPath(name) {
-  return path.join(__dirname, "..", "..", "assets", name);
+  // In a packaged build the assets folder is copied via electron-builder
+  // `extraResources` into <app>/resources/assets (process.resourcesPath). In dev
+  // it lives at desktop-app/assets, two levels up from src/main. Resolving the
+  // wrong base ships a build whose tray/window icons are missing -> blank,
+  // invisible system-tray icon.
+  const base = app.isPackaged
+    ? path.join(process.resourcesPath, "assets")
+    : path.join(__dirname, "..", "..", "assets");
+  return path.join(base, name);
 }
 
 // Human labels for each branded tray state (renderer mirrors these).
@@ -278,19 +291,23 @@ function registerIpc() {
   ipcMain.handle("app:version", () => app.getVersion());
   ipcMain.handle("update:install", () => quitAndInstall());
 
-  // Task #1758 — local-proxy bridge for the portal window. Returns a playable
-  // `em-proxy://asset/<id>` URL + parsed keyframe-index sidecar, or null when
-  // the asset isn't synced (web side falls back to the HLS Quick preview).
-  ipcMain.handle("em-proxy:resolve", (_e, assetId) => {
+  // Task #1766 — instant local scrub source. Prefers the all-intra progressive
+  // MP4 (frame-exact native <video> seeks, no sidecar) and falls back to the
+  // existing progressive proxy + keyframe-index. Returns the resolved
+  // `scrubSource` so the preview monitor can show an honest indicator. Returns
+  // null when nothing is synced yet (web falls back to the network preview).
+  ipcMain.handle("em-proxy:resolveScrubSource", (_e, assetId) => {
     try {
       const id = Number(assetId);
       if (!Number.isFinite(id) || id <= 0) return null;
-      const resolved = engine?.resolveLocalProxyFile(id);
+      const resolved = engine?.resolveLocalScrubSource(id);
       if (!resolved || !resolved.filePath) return null;
-      proxyPathByAssetId.set(id, resolved.filePath);
+      const variant = resolved.scrubSource === "all-intra" ? "intra" : "progressive";
+      proxyPathByAssetId.set(`${id}/${variant}`, resolved.filePath);
       return {
-        proxyUrl: `em-proxy://asset/${id}`,
-        keyframeIndex: resolved.keyframeIndex,
+        proxyUrl: `em-proxy://asset/${id}/${variant}`,
+        scrubSource: resolved.scrubSource,
+        keyframeIndex: resolved.keyframeIndex ?? null,
       };
     } catch (_) {
       return null;
@@ -317,12 +334,13 @@ if (!gotLock) {
     createTray();
 
     // Task #1758 — serve locally-synced proxy files over `em-proxy://`. The
-    // renderer only ever holds an `em-proxy://asset/<id>` URL; we map it back
-    // to the real path here (populated by `em-proxy:resolve`) and stream it
-    // via net.fetch(file://) which honours HTTP range requests for seeking.
+    // renderer only ever holds an `em-proxy://asset/<id>/<variant>` URL; we map
+    // it back to the real path here (populated by `em-proxy:resolveScrubSource`)
+    // and stream it via net.fetch(file://) which honours HTTP range requests for
+    // seeking.
     protocol.handle("em-proxy", (request) => {
-      const id = assetIdFromProxyUrl(request.url);
-      const filePath = id ? proxyPathByAssetId.get(id) : null;
+      const key = proxyKeyFromProxyUrl(request.url);
+      const filePath = key ? proxyPathByAssetId.get(key) : null;
       if (!filePath) return new Response(null, { status: 404 });
       return net.fetch(pathToFileURL(filePath).toString(), {
         headers: request.headers,

@@ -15,6 +15,18 @@ files:
   - "src/renderer/dist/**/*"
   - "package.json"
 
+# Runtime assets (tray icons + window/dock icon). The main process loads these
+# at runtime via assetPath(). The `assets/` folder is the buildResources dir, so
+# electron-builder does NOT pack it into the app — without copying it in, the
+# shipped app has no icon files and the system-tray icon renders blank/invisible.
+# extraResources copies it into the packaged app's resources dir (process
+# .resourcesPath/assets); assetPath() reads from there when app.isPackaged.
+extraResources:
+  - from: assets
+    to: assets
+    filter:
+      - "**/*"
+
 # Auto-update feed — GitHub Releases of THIS repo.
 # owner/repo are injected by CI from the GitHub context (see
 # .github/workflows/release.yml: GH_OWNER / GH_REPO), so the feed automatically

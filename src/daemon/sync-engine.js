@@ -246,47 +246,75 @@ class SyncEngine extends EventEmitter {
     } catch (_) {}
   }
 
-  // ---- Local-proxy bridge (Task #1758) ------------------------------------
-  // Best-effort map of an assetId → the locally-synced scrub-grade proxy file
-  // (a progressive MP4 the off-DOM <video> seeks, or an all-intra rung for the
-  // WebCodecs path) plus its parsed keyframe-index sidecar. Returns null on
-  // every "not here" path (no manifest yet, asset not synced, missing/garbled
-  // sidecar) so the web layer cleanly falls back to the HLS "Quick preview".
-  resolveLocalProxyFile(assetId) {
+  // ---- Instant local scrub source (Task #1766) ----------------------------
+  // Resolve the BEST local scrub source for an asset, preferring the new
+  // all-intra progressive MP4 (`proxy_intra`, every frame an IDR) so the
+  // native <video> element seeks to the exact frame instantly with NO
+  // keyframe-index sidecar and NO WebCodecs/byte-range demuxing. Falls back
+  // to the existing progressive proxy + keyframe-index sidecar when the
+  // all-intra file isn't synced yet, and returns null on every "not here"
+  // path so the web layer cleanly falls back to the network "Quick preview".
+  //
+  // Returns { filePath, scrubSource: 'all-intra' | 'progressive', keyframeIndex }
+  // where keyframeIndex is null for the all-intra source (none required).
+  resolveLocalScrubSource(assetId) {
     try {
       const id = Number(assetId);
       if (!Number.isFinite(id) || id <= 0) return null;
-      const file = (this.lastFiles || []).find(
-        (f) => Number(f && (f.assetId ?? f.asset_id)) === id,
-      );
-      if (!file) return null;
 
       const root = this.config.getSyncFolder();
-      const proxyPath = path.join(root, file.relativePath || file.name || "");
-      if (!proxyPath || !fs.existsSync(proxyPath)) return null;
-      // Scrub-grade proxies only: the all-intra HLS rungs (WebCodecs path) and
-      // the progressive MP4 the off-DOM <video> seeks (Task #1759). Any other
-      // declared variant is ignored so we fall back to "Quick preview".
-      if (
-        file.proxyKind &&
-        file.proxyKind !== "all-intra" &&
-        file.proxyKind !== "progressive"
-      ) {
-        return null;
+      const matches = (this.lastFiles || []).filter(
+        (f) => Number(f && (f.assetId ?? f.asset_id)) === id,
+      );
+      if (matches.length === 0) return null;
+
+      // 1) Prefer the all-intra progressive MP4 — independently seekable, no
+      //    sidecar needed. Only when the file is actually on disk; if it is in
+      //    the manifest but the download hasn't landed yet we gracefully fall
+      //    through to the progressive proxy below (honest, never a hard error).
+      const intra = matches.find((f) => f && f.proxyKind === "all-intra");
+      if (intra) {
+        const intraPath = path.join(root, intra.relativePath || intra.name || "");
+        if (intraPath && fs.existsSync(intraPath)) {
+          return {
+            filePath: intraPath,
+            scrubSource: "all-intra",
+            keyframeIndex: null,
+          };
+        }
       }
 
-      const sidecarPath = this._findKeyframeSidecar(proxyPath, file);
-      if (!sidecarPath || !fs.existsSync(sidecarPath)) return null;
-
-      let keyframeIndex;
-      try {
-        keyframeIndex = JSON.parse(fs.readFileSync(sidecarPath, "utf8"));
-      } catch (_) {
-        return null;
+      // 2) Fall back to the existing progressive proxy + keyframe-index sidecar
+      //    (tolerated until the retire task removes the sidecar path).
+      const progressive = matches.find(
+        (f) => f && (!f.proxyKind || f.proxyKind === "progressive"),
+      );
+      if (progressive) {
+        const proxyPath = path.join(
+          root,
+          progressive.relativePath || progressive.name || "",
+        );
+        if (proxyPath && fs.existsSync(proxyPath)) {
+          const sidecarPath = this._findKeyframeSidecar(proxyPath, progressive);
+          if (sidecarPath && fs.existsSync(sidecarPath)) {
+            let keyframeIndex;
+            try {
+              keyframeIndex = JSON.parse(fs.readFileSync(sidecarPath, "utf8"));
+            } catch (_) {
+              keyframeIndex = null;
+            }
+            if (keyframeIndex && typeof keyframeIndex === "object") {
+              return {
+                filePath: proxyPath,
+                scrubSource: "progressive",
+                keyframeIndex,
+              };
+            }
+          }
+        }
       }
-      if (!keyframeIndex || typeof keyframeIndex !== "object") return null;
 
-      return { filePath: proxyPath, keyframeIndex };
+      return null;
     } catch (_) {
       return null;
     }
