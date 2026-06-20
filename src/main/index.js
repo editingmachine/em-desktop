@@ -17,10 +17,11 @@ const {
   dialog,
   nativeImage,
   protocol,
-  net,
 } = require("electron");
 const path = require("path");
-const { pathToFileURL } = require("url");
+const fs = require("fs");
+const { Readable } = require("stream");
+const { parseRange, contentTypeForPath } = require("./range");
 
 // Task #1758 — the custom `em-proxy://` scheme that serves locally-synced
 // proxy files to the portal's <video> element. Must be declared privileged
@@ -56,6 +57,53 @@ function proxyKeyFromProxyUrl(rawUrl) {
   } catch (_) {
     return null;
   }
+}
+
+// Serve a local file over `em-proxy://` with HTTP Range support so the portal's
+// off-DOM <video> can seek within a clip. Returns 206 for a satisfiable range,
+// 200 for the whole file (still advertising Accept-Ranges), 416 for an
+// unsatisfiable range, or 404 if the file is gone.
+function serveLocalFileWithRange(filePath, rangeHeader) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch (_) {
+    return new Response(null, { status: 404 });
+  }
+  const total = stat.size;
+  const baseHeaders = {
+    "Content-Type": contentTypeForPath(filePath),
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+  };
+  const parsed = parseRange(total, rangeHeader);
+
+  if (parsed.kind === "unsatisfiable") {
+    return new Response(null, {
+      status: 416,
+      headers: { ...baseHeaders, "Content-Range": `bytes */${total}` },
+    });
+  }
+
+  if (parsed.kind === "range") {
+    const { start, end } = parsed;
+    const body = Readable.toWeb(fs.createReadStream(filePath, { start, end }));
+    return new Response(body, {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        "Content-Range": `bytes ${start}-${end}/${total}`,
+        "Content-Length": String(end - start + 1),
+      },
+    });
+  }
+
+  // Whole file.
+  const body = Readable.toWeb(fs.createReadStream(filePath));
+  return new Response(body, {
+    status: 200,
+    headers: { ...baseHeaders, "Content-Length": String(total) },
+  });
 }
 
 const cfg = require("../daemon/config");
@@ -291,6 +339,23 @@ function registerIpc() {
   ipcMain.handle("app:version", () => app.getVersion());
   ipcMain.handle("update:install", () => quitAndInstall());
 
+  // Task #1920 — trigger-based proxy sync. The portal calls this the moment a
+  // clip's asset is needed on the timeline but isn't on disk yet, so the daemon
+  // fetches just that asset's proxy immediately instead of waiting for the next
+  // slow sweep. Fire-and-forget + coalesced inside the engine; safe no-op when
+  // signed out.
+  ipcMain.handle("em-proxy:triggerImmediateSync", (_e, assetId) => {
+    try {
+      const id = Number(assetId);
+      if (!Number.isFinite(id) || id <= 0) return false;
+      if (!engine || !engine.token) return false;
+      engine.syncAsset(id).catch(() => {});
+      return true;
+    } catch (_) {
+      return false;
+    }
+  });
+
   // Task #1766 — instant local scrub source. Prefers the all-intra progressive
   // MP4 (frame-exact native <video> seeks, no sidecar) and falls back to the
   // existing progressive proxy + keyframe-index. Returns the resolved
@@ -336,15 +401,23 @@ if (!gotLock) {
     // Task #1758 — serve locally-synced proxy files over `em-proxy://`. The
     // renderer only ever holds an `em-proxy://asset/<id>/<variant>` URL; we map
     // it back to the real path here (populated by `em-proxy:resolveScrubSource`)
-    // and stream it via net.fetch(file://) which honours HTTP range requests for
-    // seeking.
+    // and serve it ourselves WITH HTTP Range support.
+    //
+    // Why we read the byte slice by hand instead of forwarding to
+    // net.fetch(file://): the portal compositor decodes frames by seeking an
+    // off-DOM <video> to the requested time. A <video> can only SEEK within a
+    // file if the response honours `Range` (206 + Content-Range + Accept-Ranges).
+    // Forwarding to net.fetch(file://) does NOT reliably translate the incoming
+    // Range header into a partial read — it hands back the whole file (200), so
+    // the element can load each clip's FIRST frame but can never move inside the
+    // clip. That collapsed every in-clip scrub position and every realtime
+    // playback tick onto frame 0 — the "one frozen still per clip" bug. Reading
+    // the slice with fs guarantees correct 206 partial responses on every OS.
     protocol.handle("em-proxy", (request) => {
       const key = proxyKeyFromProxyUrl(request.url);
       const filePath = key ? proxyPathByAssetId.get(key) : null;
       if (!filePath) return new Response(null, { status: 404 });
-      return net.fetch(pathToFileURL(filePath).toString(), {
-        headers: request.headers,
-      });
+      return serveLocalFileWithRange(filePath, request.headers.get("range"));
     });
 
     const restored = await engine.restoreSession();

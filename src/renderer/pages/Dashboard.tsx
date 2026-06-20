@@ -73,8 +73,13 @@ export function Dashboard({
       <header style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span style={{ width: 10, height: 10, borderRadius: "50%", background: DOT[state] }} />
         <strong>{LABEL[state]}</strong>
-        <span style={{ marginLeft: "auto", fontSize: 12, opacity: 0.6 }}>
-          {user?.name || user?.email}
+        <span style={{ marginLeft: "auto", textAlign: "right", fontSize: 12, opacity: 0.6, lineHeight: 1.3 }}>
+          {user?.name && <div>{user.name}</div>}
+          {(user?.email || status?.user?.email) && (
+            <div style={{ opacity: user?.name ? 0.8 : 1 }}>
+              {user?.email || status?.user?.email}
+            </div>
+          )}
         </span>
       </header>
 

@@ -19,4 +19,8 @@ contextBridge.exposeInMainWorld("emProxy", {
   // resolved so the preview monitor can show an honest indicator.
   resolveLocalScrubSource: (assetId) =>
     ipcRenderer.invoke("em-proxy:resolveScrubSource", assetId),
+  // Task #1920 — ask the daemon to fetch this asset's proxy right now (a clip
+  // was just added to the timeline). Fire-and-forget + coalesced in main.
+  triggerImmediateSync: (assetId) =>
+    ipcRenderer.invoke("em-proxy:triggerImmediateSync", assetId),
 });

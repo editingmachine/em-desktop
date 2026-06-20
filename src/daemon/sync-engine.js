@@ -39,6 +39,18 @@ class SyncEngine extends EventEmitter {
     // bridge can map an assetId back to a synced file on disk. Best-effort:
     // entries only carry an assetId once the manifest starts emitting one.
     this.lastFiles = [];
+    // Task #1920 — trigger-based per-asset sync. Maps an in-flight asset key to
+    // its download promise so rapid repeated triggers for the SAME asset are
+    // coalesced into one download instead of racing N concurrent fetches.
+    this._assetSyncInflight = new Map();
+    // Task #1920 — shared single-flight per DESTINATION FILE across BOTH the
+    // periodic `syncOnce` sweep and the on-demand `syncAsset` trigger. Whichever
+    // path reaches a file first owns its download; the other joins that same
+    // promise instead of starting a second fetch to the same `.part` temp file.
+    // This is the real "no duplicate/concurrent downloads" guarantee — the
+    // per-asset map above only coalesces trigger↔trigger, this covers
+    // sweep↔trigger too.
+    this._fileDownloadInflight = new Map();
   }
 
   emitStatus() {
@@ -188,6 +200,28 @@ class SyncEngine extends EventEmitter {
       this.filesPending = files.length;
       this.emitStatus();
 
+      // Aggregate progress across the WHOLE batch. A per-file percentage resets
+      // to ~0 at the start of every file, and with several small files per
+      // asset (scrub proxy + keyframe sidecar + all-intra MP4) that made the
+      // bar flicker between 0 and the real value. Instead we report
+      // (bytes done so far / total bytes to download), so the bar climbs once,
+      // smoothly, to 100. Only files we will actually fetch (not those already
+      // on disk at the right size) count toward the total.
+      const needsDownload = (f) => {
+        const d = path.join(this.config.getSyncFolder(), f.relativePath || f.name);
+        return !(fs.existsSync(d) && fs.statSync(d).size === f.size);
+      };
+      const totalBytes = files
+        .filter(needsDownload)
+        .reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+      let completedBytes = 0;
+      // Monotonic guard for THIS batch: manifest sizes (used for the total) and
+      // the live received-byte count can disagree (stale/approximate sizes), so
+      // a naive ratio could briefly tick backwards. We never emit a percent
+      // lower than the highest already shown, so the bar only ever moves
+      // forward within a sync run.
+      let lastPct = 0;
+
       for (const file of files) {
         if (this.paused || this.cancelled) break;
         const dest = path.join(this.config.getSyncFolder(), file.relativePath || file.name);
@@ -198,16 +232,33 @@ class SyncEngine extends EventEmitter {
 
         // Task #1759 — the server may hand us a derivative-specific download
         // path (scrub proxy / keyframe sidecar) via `downloadPath`; fall back
-        // to the master-asset route otherwise.
-        const downloadRoute = file.downloadPath || `/api/sync/download/${file.id}`;
-        const urlRes = await this._json("GET", downloadRoute, null);
-        if (!urlRes?.url) continue;
-        await this._download(urlRes.url, dest, (pct) =>
-          this.emit("progress", { file: file.name, pct, bytes: file.size }),
-        );
-        await this._json("POST", `/api/sync/download/${file.id}/complete`, {});
-        downloaded += 1;
-        this.filesSynced += 1;
+        // to the master-asset route otherwise. Task #1920 — routed through the
+        // shared single-flight helper so a concurrent on-demand `syncAsset`
+        // trigger for the same file never starts a second download.
+        const fileBytes = Number(file.size) || 0;
+        const result = await this._downloadFileTracked(file, (filePct, receivedBytes) => {
+          // Overall batch percentage, clamped to 100 then held monotonic so a
+          // slightly-off content-length can never overshoot or snap backwards.
+          // Falls back to the per-file pct only when we have no byte totals.
+          const raw =
+            totalBytes > 0
+              ? Math.min(
+                  100,
+                  Math.round(((completedBytes + (receivedBytes || 0)) / totalBytes) * 100),
+                )
+              : filePct;
+          lastPct = Math.max(lastPct, raw);
+          this.emit("progress", { file: file.name, pct: lastPct, bytes: file.size });
+        });
+        // "coalesced" = a trigger fetched this same file while we were sweeping;
+        // it's on disk now, so still advance the batch but don't double-count it.
+        if (result.status === "downloaded") {
+          downloaded += 1;
+          this.filesSynced += 1;
+        }
+        if (result.status === "downloaded" || result.status === "coalesced") {
+          completedBytes += fileBytes;
+        }
         this.filesPending = Math.max(0, this.filesPending - 1);
         this.emitStatus();
       }
@@ -221,6 +272,62 @@ class SyncEngine extends EventEmitter {
       this.state = "error";
       this.emitStatus();
       throw err;
+    }
+  }
+
+  // ---- Trigger-based per-asset sync (Task #1920) --------------------------
+  // Fetch a SINGLE asset's derivatives on demand, the moment a clip needs it
+  // on the timeline, instead of waiting for the next slow `syncOnce` sweep.
+  // Reuses the existing manifest + per-file download logic — it pulls the same
+  // manifest, keeps only this asset's entries, and downloads the ones not yet
+  // on disk at the right size.
+  //
+  // Coalesced: rapid repeated triggers for the same asset return the SAME
+  // in-flight promise, so an asset is never downloaded twice at once. The
+  // scheduled full sweep is untouched and still runs as the safety net.
+  async syncAsset(assetId) {
+    const id = Number(assetId);
+    if (!Number.isFinite(id) || id <= 0) return { downloaded: 0 };
+    if (!this.token || this.paused) return { downloaded: 0 };
+    const key = String(id);
+    const existing = this._assetSyncInflight.get(key);
+    if (existing) return existing;
+    const p = this._syncAssetInner(id).finally(() => {
+      this._assetSyncInflight.delete(key);
+    });
+    this._assetSyncInflight.set(key, p);
+    return p;
+  }
+
+  async _syncAssetInner(id) {
+    let downloaded = 0;
+    try {
+      const selected = this.config.config.get("selectedClients") || [];
+      const manifest = await this._json("GET", "/api/sync/manifest", null);
+      const allFiles = (manifest?.files || []).filter((f) =>
+        selected.length === 0 ? true : selected.includes(f.clientId),
+      );
+      // Keep lastFiles fresh so resolveLocalScrubSource can map the asset's
+      // files to disk as soon as the on-demand download lands.
+      this.lastFiles = allFiles;
+
+      const files = allFiles.filter((f) => Number(f && f.id) === id);
+      for (const file of files) {
+        if (this.paused || this.cancelled) break;
+        // Task #1920 — shared single-flight: if the periodic sweep (or an
+        // earlier trigger) is already fetching this exact file, join it rather
+        // than racing a second download to the same temp file.
+        const result = await this._downloadFileTracked(file);
+        if (result.status === "downloaded") {
+          downloaded += 1;
+          this.filesSynced += 1;
+        }
+      }
+      if (downloaded > 0) this.emitStatus();
+      return { downloaded };
+    } catch (err) {
+      this.emit("error", err);
+      return { downloaded };
     }
   }
 
@@ -337,6 +444,46 @@ class SyncEngine extends EventEmitter {
     return candidates.find((c) => c && fs.existsSync(c)) || null;
   }
 
+  // Download a single manifest file with shared single-flight per destination
+  // (Task #1920). Returns one of:
+  //   { status: "present" }     — already on disk at the right size, skipped
+  //   { status: "downloaded" }  — this call fetched it
+  //   { status: "coalesced" }   — another in-flight call (sweep or trigger) is
+  //                               already fetching this exact file; we joined it
+  //   { status: "no-url" }      — server returned no presigned URL
+  // Honours pause/cancel via the underlying `_download`.
+  async _downloadFileTracked(file, onProgress) {
+    const dest = path.join(
+      this.config.getSyncFolder(),
+      file.relativePath || file.name,
+    );
+    if (fs.existsSync(dest) && fs.statSync(dest).size === file.size) {
+      return { status: "present", dest };
+    }
+    // Single-flight: if this exact destination is already downloading (from the
+    // periodic sweep OR a prior trigger), join that download instead of racing
+    // a second fetch to the same `.part` temp file.
+    const existing = this._fileDownloadInflight.get(dest);
+    if (existing) {
+      await existing;
+      return { status: "coalesced", dest };
+    }
+    const downloadRoute = file.downloadPath || `/api/sync/download/${file.id}`;
+    const p = (async () => {
+      const urlRes = await this._json("GET", downloadRoute, null);
+      if (!urlRes?.url) return { status: "no-url", dest };
+      await this._download(urlRes.url, dest, onProgress);
+      await this._json("POST", `/api/sync/download/${file.id}/complete`, {});
+      return { status: "downloaded", dest };
+    })();
+    this._fileDownloadInflight.set(dest, p);
+    try {
+      return await p;
+    } finally {
+      this._fileDownloadInflight.delete(dest);
+    }
+  }
+
   // ---- Low-level helpers --------------------------------------------------
   _download(url, destPath, onProgress) {
     return new Promise((resolve, reject) => {
@@ -361,7 +508,13 @@ class SyncEngine extends EventEmitter {
             return fail(new Error("cancelled"));
           }
           received += chunk.length;
-          if (total && onProgress) onProgress(Math.round((received / total) * 100));
+          // Always report (even without a content-length header) so the
+          // batch-level aggregate can advance off received bytes; pass the
+          // raw byte count up so the engine can weight overall progress.
+          if (onProgress) {
+            const pct = total ? Math.round((received / total) * 100) : 0;
+            onProgress(pct, received);
+          }
         });
         res.pipe(file);
         file.on("finish", () =>
