@@ -6,12 +6,26 @@ declare module "*.png" {
   export default src;
 }
 
+// Task #1938 — per-project breakdown of the current manifest. One row per
+// project that has files in the manifest, with how many of its files are on the
+// local drive vs still pending; `active` is true only for the project whose
+// file is downloading right now.
+export interface ProjectSyncBreakdown {
+  projectName: string;
+  localFiles: number;
+  pendingFiles: number;
+  totalFiles: number;
+  active: boolean;
+}
+
 export interface SyncStatus {
   state: "idle" | "syncing" | "paused" | "error";
   paused: boolean;
   currentFile: string | null;
+  currentProject: string | null;
   filesSynced: number;
   filesPending: number;
+  projects: ProjectSyncBreakdown[];
   user: { email: string; name?: string } | null;
 }
 

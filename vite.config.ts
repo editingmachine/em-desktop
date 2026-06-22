@@ -11,6 +11,13 @@ export default defineConfig({
   build: {
     outDir: resolve(__dirname, "src/renderer/dist"),
     emptyOutDir: true,
+    // The renderer imports src/shared/sync-state.js — a CommonJS module also
+    // require()'d by the Electron main process (which has no build step). By
+    // default Rollup only converts CommonJS inside node_modules, so include the
+    // shared dir here or the named import fails at build time.
+    commonjsOptions: {
+      include: [/src\/shared/, /node_modules/],
+    },
   },
   server: {
     port: 5173,

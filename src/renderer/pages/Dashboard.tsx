@@ -1,33 +1,35 @@
 import React, { useEffect, useState } from "react";
 import type { SyncStatus, DiskInfo } from "../types";
+import { deriveSyncState, SYNC_LABELS } from "../../shared/sync-state";
 import logo from "../assets/logo-orange.png";
 
 const ACCENT = "#F97316"; // brand orange (Team palette)
 
 // Functional sync-state colors — must match the tray status dots in the main process.
-type DisplayState = "idle" | "synced" | "syncing" | "paused" | "error";
+type DisplayState = "offline" | "idle" | "synced" | "syncing" | "paused" | "error";
 const DOT: Record<DisplayState, string> = {
+  offline: "#9aa0a6",
   idle: "#9aa0a6",
   synced: "#22c55e",
   syncing: "#3b82f6",
   paused: "#f59e0b",
   error: "#ef4444",
 };
-const LABEL: Record<DisplayState, string> = {
-  idle: "Idle",
-  synced: "Up to date",
-  syncing: "Syncing…",
-  paused: "Paused",
-  error: "Sync error",
-};
+// Human labels come from the shared sync-state module so this window header and
+// the tray tooltip/menu (main process) always read identically.
+const LABEL: Record<DisplayState, string> = SYNC_LABELS;
 
-// Derive the same branded state the tray shows (adds a clear "up to date" state).
+// Derive the branded logical state. The rule itself lives in the shared
+// sync-state module so this window and the tray dot (main process trayState)
+// can never drift apart. No status snapshot yet ⇒ we're not connected to the
+// engine, i.e. offline.
 function displayState(status: SyncStatus | null): DisplayState {
-  if (!status) return "idle";
-  if (status.state === "error") return "error";
-  if (status.paused || status.state === "paused") return "paused";
-  if (status.state === "syncing") return "syncing";
-  return status.filesSynced > 0 && status.filesPending === 0 ? "synced" : "idle";
+  return deriveSyncState({
+    signedIn: !!status,
+    state: status?.state,
+    paused: status?.paused,
+    filesPending: status?.filesPending,
+  });
 }
 
 function fmt(bytes: number | null | undefined): string {
@@ -93,28 +95,8 @@ export function Dashboard({
         </div>
       )}
 
-      <div style={card}>
-        <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>Storage</div>
-        <div style={{ background: "#23272e", borderRadius: 6, overflow: "hidden", height: 8 }}>
-          <div style={{ width: `${diskPct}%`, height: "100%", background: DOT.synced }} />
-        </div>
-        <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
-          {fmt(disk?.usedBytes)} / {fmt(disk?.totalBytes)} used
-        </div>
-      </div>
-
-      <div style={{ display: "flex", gap: 12, fontSize: 13 }}>
-        <div style={{ ...card, flex: 1 }}>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>{status?.filesSynced ?? 0}</div>
-          <div style={{ opacity: 0.6 }}>Synced</div>
-        </div>
-        <div style={{ ...card, flex: 1 }}>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>{status?.filesPending ?? 0}</div>
-          <div style={{ opacity: 0.6 }}>Pending</div>
-        </div>
-      </div>
-
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: "auto" }}>
+      {/* Task #1938 — controls moved to the top, directly above the Storage bar. */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         {status?.paused ? (
           <button style={btn} onClick={() => window.emSync.resumeSync()}>Resume</button>
         ) : (
@@ -126,9 +108,89 @@ export function Dashboard({
         <button style={btn} onClick={onOpenSettings}>Settings</button>
         <button style={{ ...btn, color: ACCENT, borderColor: "#3a2a1c" }} onClick={onLogout}>Log Out</button>
       </div>
+
+      <div style={card}>
+        <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>Storage</div>
+        <div style={{ background: "#23272e", borderRadius: 6, overflow: "hidden", height: 8 }}>
+          <div style={{ width: `${diskPct}%`, height: "100%", background: DOT.synced }} />
+        </div>
+        <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
+          {fmt(disk?.usedBytes)} / {fmt(disk?.totalBytes)} used
+        </div>
+      </div>
+
+      <ProjectBreakdown status={status} />
     </div>
   );
 }
+
+// Task #1938 — per-project sync breakdown. Replaces the two global Synced /
+// Pending tiles with one row per project that still has files queued or
+// downloading, each showing local-vs-pending counts and an active indicator,
+// plus a compact overall summary line so the global picture isn't lost. Empty
+// and all-synced states are honest — no placeholder numbers.
+function ProjectBreakdown({ status }: { status: SyncStatus | null }) {
+  const projects = status?.projects ?? [];
+  const totalLocal = projects.reduce((s, p) => s + p.localFiles, 0);
+  const totalFiles = projects.reduce((s, p) => s + p.totalFiles, 0);
+  // Only show projects with work left (queued or in progress); fully-synced
+  // projects collapse into the summary + the all-synced empty state.
+  const pending = projects.filter((p) => p.pendingFiles > 0);
+
+  return (
+    <div style={{ ...card, flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={{ fontSize: 12, opacity: 0.6 }}>Projects</div>
+        {totalFiles > 0 && (
+          <div style={{ fontSize: 12, opacity: 0.6 }}>
+            {totalLocal} of {totalFiles} files on this device
+          </div>
+        )}
+      </div>
+
+      {totalFiles === 0 ? (
+        <div style={emptyText}>Nothing to sync yet</div>
+      ) : pending.length === 0 ? (
+        <div style={emptyText}>All projects synced</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto" }}>
+          {pending.map((p) => (
+            <div
+              key={p.projectName}
+              style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}
+            >
+              <span
+                title={p.active ? "Downloading now" : "Queued"}
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  flexShrink: 0,
+                  background: p.active ? DOT.syncing : DOT.idle,
+                }}
+              />
+              <div style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {p.projectName}
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.7, textAlign: "right", flexShrink: 0 }}>
+                <span style={{ color: p.active ? DOT.syncing : undefined }}>
+                  {p.localFiles}/{p.totalFiles} local
+                </span>
+                <span style={{ opacity: 0.6 }}> · {p.pendingFiles} pending</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const emptyText: React.CSSProperties = {
+  fontSize: 13,
+  opacity: 0.5,
+  padding: "8px 0",
+};
 
 const card: React.CSSProperties = {
   background: "#1a1d23",

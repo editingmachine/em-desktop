@@ -32,8 +32,17 @@ class SyncEngine extends EventEmitter {
     this.paused = false;
     this.cancelled = false;
     this.currentFile = null;
+    // Task #1938 — the project whose file is currently being downloaded, so the
+    // window can mark the active row. Cleared when the sweep goes idle.
+    this.currentProject = null;
     this.filesSynced = 0;
     this.filesPending = 0;
+    // Task #1938 — per-project breakdown of the LATEST manifest, grouped by the
+    // human project name already on each file. Each entry is
+    // { projectName, localFiles, pendingFiles, totalFiles }; the live `active`
+    // flag is layered on at emit time (see getStatusSnapshot) so a pause can't
+    // leave a stale "downloading" marker baked into the array.
+    this.projectBreakdown = [];
     this._timer = null;
     // Task #1758 — last manifest's file list, kept so the local-proxy
     // bridge can map an assetId back to a synced file on disk. Best-effort:
@@ -53,15 +62,66 @@ class SyncEngine extends EventEmitter {
     this._fileDownloadInflight = new Map();
   }
 
-  emitStatus() {
-    this.emit("status", {
+  // Task #1938 — single source of truth for the status payload the UI/tray
+  // consume, so the live "status" event and the on-demand `sync:status` IPC
+  // pull (main/index.js) can never drift apart. The per-project `active` flag is
+  // computed HERE (not stored on the array) so it always reflects the current
+  // state: it is only true while we're actively syncing the project that owns
+  // the in-flight file, and clears the moment we pause / go idle.
+  getStatusSnapshot() {
+    const activeProject = this.currentProject || null;
+    const projects = (this.projectBreakdown || []).map((p) => ({
+      projectName: p.projectName,
+      localFiles: p.localFiles,
+      pendingFiles: p.pendingFiles,
+      totalFiles: p.totalFiles,
+      active: this.state === "syncing" && p.projectName === activeProject,
+    }));
+    return {
       state: this.state,
       paused: this.paused,
       currentFile: this.currentFile,
+      currentProject: activeProject,
       filesSynced: this.filesSynced,
       filesPending: this.filesPending,
+      projects,
       user: this.user ? { email: this.user.email, name: this.user.name } : null,
-    });
+    };
+  }
+
+  emitStatus() {
+    this.emit("status", this.getStatusSnapshot());
+  }
+
+  // Task #1938 — rebuild the per-project breakdown from the LATEST manifest file
+  // list (`this.lastFiles`), grouping by the human project name already carried
+  // on each file and counting how many of each project's files are already on
+  // the local drive at the right size vs still pending download. Best-effort:
+  // a failed stat just counts that file as pending. Called whenever the manifest
+  // changes or a download lands so the window reflects live progress.
+  _recomputeProjectBreakdown() {
+    const root = this.config.getSyncFolder();
+    const byProject = new Map();
+    for (const f of this.lastFiles || []) {
+      const projectName = (f && f.projectName) || "General";
+      let entry = byProject.get(projectName);
+      if (!entry) {
+        entry = { projectName, localFiles: 0, pendingFiles: 0, totalFiles: 0 };
+        byProject.set(projectName, entry);
+      }
+      entry.totalFiles += 1;
+      let onDisk = false;
+      try {
+        const dest = path.join(root, f.relativePath || f.name);
+        onDisk = fs.existsSync(dest) && fs.statSync(dest).size === f.size;
+      } catch (_) {}
+      if (onDisk) entry.localFiles += 1;
+      else entry.pendingFiles += 1;
+    }
+    // Stable alphabetical order so rows don't jump around between updates.
+    this.projectBreakdown = Array.from(byProject.values()).sort((a, b) =>
+      a.projectName.localeCompare(b.projectName),
+    );
   }
 
   async restoreSession() {
@@ -198,6 +258,10 @@ class SyncEngine extends EventEmitter {
       this.lastFiles = files;
 
       this.filesPending = files.length;
+      // Task #1938 — seed the per-project breakdown from the fresh manifest
+      // before we start downloading so the window shows correct local-vs-pending
+      // counts immediately, not only after the first file lands.
+      this._recomputeProjectBreakdown();
       this.emitStatus();
 
       // Aggregate progress across the WHOLE batch. A per-file percentage resets
@@ -228,6 +292,9 @@ class SyncEngine extends EventEmitter {
         if (fs.existsSync(dest) && fs.statSync(dest).size === file.size) continue;
 
         this.currentFile = file.name;
+        // Task #1938 — remember which project this in-flight file belongs to so
+        // the window can mark exactly one row as actively downloading.
+        this.currentProject = file.projectName || "General";
         this.emitStatus();
 
         // Task #1759 — the server may hand us a derivative-specific download
@@ -260,12 +327,19 @@ class SyncEngine extends EventEmitter {
           completedBytes += fileBytes;
         }
         this.filesPending = Math.max(0, this.filesPending - 1);
+        // Task #1938 — recompute so this project's row moves a file from
+        // pending → local the moment the download lands.
+        this._recomputeProjectBreakdown();
         this.emitStatus();
       }
 
       await this._cleanupRemoved(files);
       this.currentFile = null;
+      this.currentProject = null;
       this.state = this.paused ? "paused" : "idle";
+      // Task #1938 — final recompute after cleanup so removed-server-side files
+      // drop out of the breakdown and the all-synced state reads honestly.
+      this._recomputeProjectBreakdown();
       this.emitStatus();
       return { downloaded };
     } catch (err) {
@@ -323,6 +397,9 @@ class SyncEngine extends EventEmitter {
           this.filesSynced += 1;
         }
       }
+      // Task #1938 — refresh the breakdown so a triggered asset's files also
+      // move pending → local in the window, not just sweep downloads.
+      this._recomputeProjectBreakdown();
       if (downloaded > 0) this.emitStatus();
       return { downloaded };
     } catch (err) {

@@ -111,6 +111,7 @@ const keychain = require("../daemon/keychain");
 const { getDiskUsage } = require("../daemon/disk");
 const { SyncEngine, DEFAULT_API_BASE } = require("../daemon/sync-engine");
 const { setAutoLaunch, getAutoLaunch } = require("./auto-launch");
+const { deriveSyncState, SYNC_LABELS } = require("../shared/sync-state");
 const { initAutoUpdate, quitAndInstall } = require("./updater");
 
 const PORTAL_URL = process.env.EM_PORTAL_URL || DEFAULT_API_BASE;
@@ -133,31 +134,16 @@ function assetPath(name) {
   return path.join(base, name);
 }
 
-// Human labels for each branded tray state (renderer mirrors these).
-const TRAY_LABELS = {
-  idle: "Idle",
-  synced: "Up to date",
-  syncing: "Syncing…",
-  paused: "Paused",
-  error: "Sync error",
-  offline: "Offline",
-};
-
-// The main process is the single source of truth for the state→icon mapping.
-// Derive the branded tray state from the engine, adding a clear "up to date"
-// state (synced, nothing pending) and an "offline" state (signed out).
+// Derive the branded tray state from the engine. The actual rule lives in the
+// shared sync-state module so the tray and the control window (Dashboard.tsx
+// displayState) can never drift apart.
 function trayState() {
-  if (!engine || !engine.token) return "offline";
-  switch (engine.state) {
-    case "error":
-      return "error";
-    case "paused":
-      return "paused";
-    case "syncing":
-      return "syncing";
-    default:
-      return engine.filesSynced > 0 && engine.filesPending === 0 ? "synced" : "idle";
-  }
+  return deriveSyncState({
+    signedIn: !!(engine && engine.token),
+    state: engine?.state,
+    paused: engine?.paused,
+    filesPending: engine?.filesPending,
+  });
 }
 
 function trayIcon(state) {
@@ -233,7 +219,7 @@ function openPortal() {
 }
 
 function buildTrayMenu() {
-  const label = TRAY_LABELS[trayState()] || "Idle";
+  const label = SYNC_LABELS[trayState()] || SYNC_LABELS.idle;
   return Menu.buildFromTemplate([
     { label: `Status: ${label}`, enabled: false },
     { type: "separator" },
@@ -254,7 +240,7 @@ function refreshTray() {
   if (!tray) return;
   const s = trayState();
   tray.setImage(trayIcon(s));
-  tray.setToolTip(`Editing Machine Sync — ${TRAY_LABELS[s] || s}`);
+  tray.setToolTip(`Editing Machine Sync — ${SYNC_LABELS[s] || s}`);
   tray.setContextMenu(buildTrayMenu());
 }
 
@@ -299,14 +285,10 @@ function registerIpc() {
   ipcMain.handle("sync:pause", () => { engine.pause(); return true; });
   ipcMain.handle("sync:resume", () => { engine.resume(); return true; });
   ipcMain.handle("sync:now", () => engine.syncOnce().then(() => true).catch(() => false));
-  ipcMain.handle("sync:status", () => ({
-    state: engine.state,
-    paused: engine.paused,
-    currentFile: engine.currentFile,
-    filesSynced: engine.filesSynced,
-    filesPending: engine.filesPending,
-    user: engine.user,
-  }));
+  // Task #1938 — return the SAME shape the live "status" event emits (incl. the
+  // per-project breakdown) via the engine's single snapshot builder, so the
+  // initial fetch and live updates never disagree.
+  ipcMain.handle("sync:status", () => engine.getStatusSnapshot());
 
   ipcMain.handle("disk:info", () => getDiskUsage(cfg.getSyncFolder()));
 
