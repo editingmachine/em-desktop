@@ -7,11 +7,15 @@ directories:
   output: build
   buildResources: assets
 
-# Ship the daemon + main + preload (JS) and the built renderer (Vite → src/renderer/dist).
+# Ship the daemon + main + preload (JS), the shared helpers, and the built renderer (Vite → src/renderer/dist).
+# src/shared holds modules required at runtime by the main process (e.g. ../shared/sync-state
+# from src/main/index.js). Omitting it ships an app.asar that crashes on launch with
+# "Cannot find module '../shared/sync-state'".
 files:
   - "src/main/**/*"
   - "src/daemon/**/*"
   - "src/preload/**/*"
+  - "src/shared/**/*"
   - "src/renderer/dist/**/*"
   - "package.json"
 
