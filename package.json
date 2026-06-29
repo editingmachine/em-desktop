@@ -1,6 +1,6 @@
 {
   "name": "em-desktop",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Editing Machine desktop shell — portal window + background file-sync daemon",
   "author": "Editing Machine",
   "main": "src/main/index.js",

@@ -338,9 +338,8 @@ function registerIpc() {
     }
   });
 
-  // Task #1766 — instant local scrub source. Prefers the all-intra progressive
-  // MP4 (frame-exact native <video> seeks, no sidecar) and falls back to the
-  // existing progressive proxy + keyframe-index. Returns the resolved
+  // Task #1766 — instant local scrub source: the all-intra progressive MP4
+  // (frame-exact native <video> seeks, no sidecar). Returns the resolved
   // `scrubSource` so the preview monitor can show an honest indicator. Returns
   // null when nothing is synced yet (web falls back to the network preview).
   ipcMain.handle("em-proxy:resolveScrubSource", (_e, assetId) => {
@@ -349,12 +348,10 @@ function registerIpc() {
       if (!Number.isFinite(id) || id <= 0) return null;
       const resolved = engine?.resolveLocalScrubSource(id);
       if (!resolved || !resolved.filePath) return null;
-      const variant = resolved.scrubSource === "all-intra" ? "intra" : "progressive";
-      proxyPathByAssetId.set(`${id}/${variant}`, resolved.filePath);
+      proxyPathByAssetId.set(`${id}/intra`, resolved.filePath);
       return {
-        proxyUrl: `em-proxy://asset/${id}/${variant}`,
+        proxyUrl: `em-proxy://asset/${id}/intra`,
         scrubSource: resolved.scrubSource,
-        keyframeIndex: resolved.keyframeIndex ?? null,
       };
     } catch (_) {
       return null;

@@ -203,3 +203,243 @@ describe("SyncEngine per-project breakdown (Task #1938)", () => {
     expect(snap.projects).toEqual([]);
   });
 });
+
+// One bad file (e.g. a missing/expired S3 object that 403s, or a transient
+// network blip) must NEVER halt the whole sweep — every OTHER file still needs
+// to download. This is the fix for the "stuck at N of M files, pending forever"
+// wedge where the sync died behind the first failing file.
+describe("SyncEngine sweep resilience to a single failing file", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+
+  function makeEngineWithBadFile() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "em-sync-resilience-"));
+    const store = new Map([["selectedClients", []]]);
+    const config = {
+      config: { get: (k) => store.get(k), set: (k, v) => store.set(k, v), delete: (k) => store.delete(k) },
+      getSyncFolder: () => root,
+    };
+    // downloadRetryBaseMs:0 keeps the Task #2164 retry backoff instant so the
+    // persistently-failing bad file (retried then given up on) doesn't slow the
+    // test; _sleep is also stubbed defensively.
+    const engine = new SyncEngine({ apiBase: "http://test.local", config, keychain: {}, getDiskUsage: async () => ({}), downloadRetryBaseMs: 0 });
+    engine.token = "test-token";
+    engine._sleep = async () => {};
+
+    // Three files; the MIDDLE one's bytes transfer always fails (like a 403 on
+    // a missing S3 object). Before the fix this aborted the whole for-loop and
+    // left file #3 pending forever. Post-#2164 the 403 is retried a few times
+    // (fresh URL each attempt) and, still failing, the file stays honestly
+    // pending — the sweep never wedges.
+    const manifest = {
+      files: [
+        { id: 1, name: "ok1.mp3", relativePath: "ok1.mp3", size: 10, clientId: 1, projectName: "P" },
+        { id: 2, name: "bad.mp3", relativePath: "bad.mp3", size: 10, clientId: 1, projectName: "P" },
+        { id: 3, name: "ok3.mp3", relativePath: "ok3.mp3", size: 10, clientId: 1, projectName: "P" },
+      ],
+    };
+    engine._json = vi.fn(async (method, route) => {
+      if (route === "/api/sync/manifest") return manifest;
+      if (route.endsWith("/complete")) return {};
+      if (route.startsWith("/api/sync/download/")) return { url: `http://files/${route}` };
+      return {};
+    });
+    engine._download = vi.fn(async (_url, destPath) => {
+      if (destPath.endsWith("bad.mp3")) throw new Error("HTTP 403");
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      fs.writeFileSync(destPath, Buffer.alloc(10));
+    });
+    return { engine, root };
+  }
+
+  it("downloads every healthy file and skips only the bad one (no wedge)", async () => {
+    const { engine, root } = makeEngineWithBadFile();
+    const res = await engine.syncOnce();
+
+    // The two good files downloaded; the bad one did NOT halt the sweep.
+    expect(res.downloaded).toBe(2);
+    expect(fs.existsSync(path.join(root, "ok1.mp3"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "ok3.mp3"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "bad.mp3"))).toBe(false);
+
+    // Sweep ended cleanly (not stuck in an error state), and the breakdown
+    // honestly shows 2 local / 1 pending instead of wedging at 0.
+    expect(engine.state).toBe("idle");
+    const p = engine.getStatusSnapshot().projects.find((x) => x.projectName === "P");
+    expect(p).toMatchObject({ totalFiles: 3, localFiles: 2, pendingFiles: 1 });
+  });
+
+  it("treats a missing presigned URL ('no-url') as a skipped failure, not a silent success", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "em-sync-nourl-"));
+    const store = new Map([["selectedClients", []]]);
+    const config = {
+      config: { get: (k) => store.get(k), set: (k, v) => store.set(k, v), delete: (k) => store.delete(k) },
+      getSyncFolder: () => root,
+    };
+    const engine = new SyncEngine({ apiBase: "http://test.local", config, keychain: {}, getDiskUsage: async () => ({}) });
+    engine.token = "test-token";
+
+    const manifest = {
+      files: [
+        { id: 1, name: "ok.mp3", relativePath: "ok.mp3", size: 10, clientId: 1, projectName: "P" },
+        { id: 2, name: "nourl.mp3", relativePath: "nourl.mp3", size: 10, clientId: 1, projectName: "P" },
+      ],
+    };
+    engine._json = vi.fn(async (method, route) => {
+      if (route === "/api/sync/manifest") return manifest;
+      if (route.endsWith("/complete")) return {};
+      // Asset 2's download endpoint returns no url (e.g. asset has no stored file).
+      if (route.startsWith("/api/sync/download/2")) return {};
+      if (route.startsWith("/api/sync/download/")) return { url: `http://files/${route}` };
+      return {};
+    });
+    engine._download = vi.fn(async (_url, destPath) => {
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      fs.writeFileSync(destPath, Buffer.alloc(10));
+    });
+
+    const res = await engine.syncOnce();
+    expect(res.downloaded).toBe(1);
+    expect(fs.existsSync(path.join(root, "ok.mp3"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "nourl.mp3"))).toBe(false);
+    expect(engine.state).toBe("idle");
+    const p = engine.getStatusSnapshot().projects.find((x) => x.projectName === "P");
+    expect(p).toMatchObject({ totalFiles: 2, localFiles: 1, pendingFiles: 1 });
+  });
+});
+
+// Task #2164 — Dropbox-grade download reliability: retry-with-backoff on
+// transient failures (fresh presigned URL each attempt), post-download integrity
+// verification, and unknown-size handling so a 0/missing-size file isn't
+// re-downloaded on every sweep.
+describe("SyncEngine download reliability (Task #2164)", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const http = require("http");
+
+  function makeEngine(manifestFiles, downloadImpl) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "em-sync-2164-"));
+    const store = new Map([["selectedClients", []]]);
+    const config = {
+      config: { get: (k) => store.get(k), set: (k, v) => store.set(k, v), delete: (k) => store.delete(k) },
+      getSyncFolder: () => root,
+    };
+    const engine = new SyncEngine({
+      apiBase: "http://test.local",
+      config,
+      keychain: {},
+      getDiskUsage: async () => ({}),
+      downloadRetryBaseMs: 0,
+    });
+    engine.token = "test-token";
+    engine._sleep = vi.fn(async () => {}); // instant backoff in tests
+    let urlFetches = 0;
+    engine._json = vi.fn(async (method, route) => {
+      if (route === "/api/sync/manifest") return { files: manifestFiles };
+      if (route.endsWith("/complete")) return {};
+      if (route.startsWith("/api/sync/download/")) {
+        urlFetches++;
+        return { url: `http://files${route}?sig=${urlFetches}` };
+      }
+      return {};
+    });
+    engine._download = vi.fn(downloadImpl);
+    return { engine, root, getUrlFetches: () => urlFetches };
+  }
+
+  it("retries a transient failure and succeeds without waiting for the next sweep (fresh URL each attempt)", async () => {
+    let calls = 0;
+    const { engine, root, getUrlFetches } = makeEngine(
+      [{ id: 1, name: "ok.mp4", relativePath: "ok.mp4", size: 10, clientId: 1, projectName: "P" }],
+      async (_url, destPath) => {
+        calls++;
+        if (calls === 1) throw new Error("HTTP 503"); // transient
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
+        fs.writeFileSync(destPath, Buffer.alloc(10));
+      },
+    );
+
+    const res = await engine.syncOnce();
+
+    expect(calls).toBe(2); // failed once, succeeded on retry
+    expect(getUrlFetches()).toBe(2); // a FRESH presigned URL per attempt
+    expect(engine._sleep).toHaveBeenCalledTimes(1); // backed off once
+    expect(res.downloaded).toBe(1);
+    expect(fs.existsSync(path.join(root, "ok.mp4"))).toBe(true);
+    const p = engine.getStatusSnapshot().projects.find((x) => x.projectName === "P");
+    expect(p).toMatchObject({ totalFiles: 1, localFiles: 1, pendingFiles: 0 });
+  });
+
+  it("rejects a wrong-size download, discards it, and re-fetches until the bytes match", async () => {
+    let calls = 0;
+    const { engine, root } = makeEngine(
+      [{ id: 1, name: "v.mp4", relativePath: "v.mp4", size: 10, clientId: 1, projectName: "P" }],
+      async (_url, destPath) => {
+        calls++;
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
+        // First attempt lands a truncated file; second lands the full file.
+        fs.writeFileSync(destPath, Buffer.alloc(calls === 1 ? 5 : 10));
+      },
+    );
+
+    const res = await engine.syncOnce();
+
+    expect(calls).toBe(2); // truncated file rejected + re-fetched
+    expect(res.downloaded).toBe(1);
+    expect(fs.statSync(path.join(root, "v.mp4")).size).toBe(10);
+  });
+
+  it("verifies size inside _download and never promotes a truncated temp file", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "em-sync-2164-dl-"));
+    const store = new Map([["selectedClients", []]]);
+    const config = {
+      config: { get: (k) => store.get(k), set: (k, v) => store.set(k, v), delete: (k) => store.delete(k) },
+      getSyncFolder: () => root,
+    };
+    const engine = new SyncEngine({ apiBase: "http://test.local", config, keychain: {}, getDiskUsage: async () => ({}) });
+
+    // Server hands back only 5 bytes though we expect 10.
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200);
+      res.end(Buffer.alloc(5));
+    });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const port = srv.address().port;
+    const dest = path.join(root, "x.mp4");
+
+    await expect(
+      engine._download(`http://127.0.0.1:${port}/x`, dest, null, 10),
+    ).rejects.toThrow(/size-mismatch/);
+    expect(fs.existsSync(dest)).toBe(false); // never promoted to final name
+    expect(fs.existsSync(`${dest}.part`)).toBe(false); // temp cleaned up
+
+    await new Promise((r) => srv.close(r));
+  });
+
+  it("does NOT re-download an unknown-size (0) file that is already on disk every sweep", async () => {
+    let calls = 0;
+    const { engine, root } = makeEngine(
+      // size 0 == unknown (e.g. proxy whose size couldn't be read)
+      [{ id: 1, name: "u.mp4", relativePath: "u.mp4", size: 0, clientId: 1, projectName: "P" }],
+      async (_url, destPath) => {
+        calls++;
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
+        fs.writeFileSync(destPath, Buffer.alloc(12));
+      },
+    );
+
+    const first = await engine.syncOnce();
+    expect(first.downloaded).toBe(1);
+    expect(calls).toBe(1);
+
+    // Second sweep: the file is on disk and non-empty, so an unknown-size file
+    // must be treated as present rather than perpetually re-fetched.
+    const second = await engine.syncOnce();
+    expect(calls).toBe(1); // NOT re-downloaded
+    expect(second.downloaded).toBe(0);
+    const p = engine.getStatusSnapshot().projects.find((x) => x.projectName === "P");
+    expect(p).toMatchObject({ totalFiles: 1, localFiles: 1, pendingFiles: 0 });
+  });
+});

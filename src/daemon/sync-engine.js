@@ -60,6 +60,67 @@ class SyncEngine extends EventEmitter {
     // per-asset map above only coalesces trigger↔trigger, this covers
     // sweep↔trigger too.
     this._fileDownloadInflight = new Map();
+    // Task #2164 — Dropbox-grade download reliability. A single per-file
+    // attempt with no integrity check let a transient blip (network drop, 5xx,
+    // expired-link 403) or a half-written/corrupt file sit pending until the
+    // next ~5-min sweep. We now retry transient failures with exponential
+    // backoff (fetching a FRESH presigned URL each attempt) and verify the
+    // downloaded byte count against the expected size before accepting a file.
+    this._maxDownloadAttempts = Number(opts.maxDownloadAttempts) || 3;
+    // Base backoff in ms; the Nth retry waits base * 2^(attempt-1) (+ jitter).
+    // Configurable so tests can drive it to ~0 instead of waiting seconds.
+    this._downloadRetryBaseMs =
+      opts.downloadRetryBaseMs != null ? Number(opts.downloadRetryBaseMs) : 500;
+  }
+
+  // Task #2164 — backoff sleep, isolated so tests can stub it to run instantly.
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+  }
+
+  // Task #2164 — exponential backoff (with small jitter) for the Nth retry.
+  _downloadRetryDelayMs(attempt) {
+    const base = this._downloadRetryBaseMs * Math.pow(2, Math.max(0, attempt - 1));
+    return base + Math.floor(Math.random() * Math.min(base, 250));
+  }
+
+  // Task #2164 — classify a download failure as transient (worth retrying with
+  // a fresh URL) vs permanent. Transient: any network/socket error, an HTTP 5xx,
+  // a request-timeout (408), rate-limit (429), an expired-link 403, or our own
+  // post-download size-mismatch. Permanent: a genuine 404 (object missing on the
+  // cloud — stays honestly pending), a 'no-url' response, or a user cancel.
+  _isRetryableDownloadError(err) {
+    const msg = (err && err.message ? err.message : String(err || "")).toLowerCase();
+    if (!msg) return false;
+    if (msg.includes("cancelled")) return false;
+    if (msg.includes("size-mismatch")) return true;
+    const httpMatch = msg.match(/http (\d{3})/);
+    if (httpMatch) {
+      const code = Number(httpMatch[1]);
+      if (code === 403 || code === 408 || code === 429) return true;
+      if (code >= 500) return true;
+      return false; // 404 and other 4xx are not retryable.
+    }
+    // Bare network / socket failures have no HTTP code — treat as transient.
+    return true;
+  }
+
+  // Task #2164 — single source of truth for the "already on disk?" check.
+  // When the expected size is known and non-zero we require an exact match.
+  // When it is unknown (0/missing) — which would make `actual === 0` never
+  // match a real file and re-download it on EVERY sweep forever — we accept any
+  // non-empty file that is already on disk as present. The server normally
+  // ships a real size now (Task #2164 steps 4/5); this is the defensive guard.
+  _isFileLocal(dest, expectedSize) {
+    try {
+      if (!fs.existsSync(dest)) return false;
+      const actual = fs.statSync(dest).size;
+      const expected = Number(expectedSize) || 0;
+      if (expected > 0) return actual === expected;
+      return actual > 0;
+    } catch (_) {
+      return false;
+    }
   }
 
   // Task #1938 — single source of truth for the status payload the UI/tray
@@ -110,11 +171,8 @@ class SyncEngine extends EventEmitter {
         byProject.set(projectName, entry);
       }
       entry.totalFiles += 1;
-      let onDisk = false;
-      try {
-        const dest = path.join(root, f.relativePath || f.name);
-        onDisk = fs.existsSync(dest) && fs.statSync(dest).size === f.size;
-      } catch (_) {}
+      const dest = path.join(root, f.relativePath || f.name);
+      const onDisk = this._isFileLocal(dest, f.size);
       if (onDisk) entry.localFiles += 1;
       else entry.pendingFiles += 1;
     }
@@ -273,7 +331,7 @@ class SyncEngine extends EventEmitter {
       // on disk at the right size) count toward the total.
       const needsDownload = (f) => {
         const d = path.join(this.config.getSyncFolder(), f.relativePath || f.name);
-        return !(fs.existsSync(d) && fs.statSync(d).size === f.size);
+        return !this._isFileLocal(d, f.size);
       };
       const totalBytes = files
         .filter(needsDownload)
@@ -285,11 +343,15 @@ class SyncEngine extends EventEmitter {
       // lower than the highest already shown, so the bar only ever moves
       // forward within a sync run.
       let lastPct = 0;
+      // Per-file failures encountered this sweep. A single bad file (e.g. a
+      // missing/expired S3 object that 403s, or a transient network blip) must
+      // NEVER halt the whole sweep — every OTHER file still needs to download.
+      let failed = 0;
 
       for (const file of files) {
         if (this.paused || this.cancelled) break;
         const dest = path.join(this.config.getSyncFolder(), file.relativePath || file.name);
-        if (fs.existsSync(dest) && fs.statSync(dest).size === file.size) continue;
+        if (this._isFileLocal(dest, file.size)) continue;
 
         this.currentFile = file.name;
         // Task #1938 — remember which project this in-flight file belongs to so
@@ -297,40 +359,71 @@ class SyncEngine extends EventEmitter {
         this.currentProject = file.projectName || "General";
         this.emitStatus();
 
-        // Task #1759 — the server may hand us a derivative-specific download
-        // path (scrub proxy / keyframe sidecar) via `downloadPath`; fall back
-        // to the master-asset route otherwise. Task #1920 — routed through the
-        // shared single-flight helper so a concurrent on-demand `syncAsset`
-        // trigger for the same file never starts a second download.
         const fileBytes = Number(file.size) || 0;
-        const result = await this._downloadFileTracked(file, (filePct, receivedBytes) => {
-          // Overall batch percentage, clamped to 100 then held monotonic so a
-          // slightly-off content-length can never overshoot or snap backwards.
-          // Falls back to the per-file pct only when we have no byte totals.
-          const raw =
-            totalBytes > 0
-              ? Math.min(
-                  100,
-                  Math.round(((completedBytes + (receivedBytes || 0)) / totalBytes) * 100),
-                )
-              : filePct;
-          lastPct = Math.max(lastPct, raw);
-          this.emit("progress", { file: file.name, pct: lastPct, bytes: file.size });
-        });
-        // "coalesced" = a trigger fetched this same file while we were sweeping;
-        // it's on disk now, so still advance the batch but don't double-count it.
-        if (result.status === "downloaded") {
-          downloaded += 1;
-          this.filesSynced += 1;
-        }
-        if (result.status === "downloaded" || result.status === "coalesced") {
+        // Per-file isolation: one file's failure must not abort the sweep.
+        // Without this try/catch a single non-200 download (or a failed
+        // `.../complete` POST) rejected out of the for-loop, jumped to the
+        // outer catch, and left EVERY file after it permanently pending —
+        // the sync would wedge behind the first bad file forever. We now log
+        // the failure, leave that one file pending (honest count), and keep
+        // going so the rest of the batch still syncs.
+        try {
+          // Task #1759 — the server may hand us a derivative-specific download
+          // path (scrub proxy) via `downloadPath`; fall back to the
+          // master-asset route otherwise. Task #1920 — routed through the
+          // shared single-flight helper so a concurrent on-demand `syncAsset`
+          // trigger for the same file never starts a second download.
+          const result = await this._downloadFileTracked(file, (filePct, receivedBytes) => {
+            // Overall batch percentage, clamped to 100 then held monotonic so a
+            // slightly-off content-length can never overshoot or snap backwards.
+            // Falls back to the per-file pct only when we have no byte totals.
+            const raw =
+              totalBytes > 0
+                ? Math.min(
+                    100,
+                    Math.round(((completedBytes + (receivedBytes || 0)) / totalBytes) * 100),
+                  )
+                : filePct;
+            lastPct = Math.max(lastPct, raw);
+            this.emit("progress", { file: file.name, pct: lastPct, bytes: file.size });
+          });
+          // "coalesced" = a trigger fetched this same file while we were
+          // sweeping; it's on disk now, so still advance the batch but don't
+          // double-count it.
+          if (result.status === "downloaded") {
+            downloaded += 1;
+            this.filesSynced += 1;
+          }
+          if (result.status === "downloaded" || result.status === "coalesced") {
+            completedBytes += fileBytes;
+          }
+          if (result.status === "no-url") {
+            // No presigned URL came back (e.g. the asset has no stored file) —
+            // count it as a skipped failure rather than a success.
+            failed += 1;
+          } else {
+            this.filesPending = Math.max(0, this.filesPending - 1);
+          }
+        } catch (err) {
+          failed += 1;
+          console.warn(
+            `[SYNC] skipping "${file.name}" (asset ${file.id}) — download failed, will retry next sweep:`,
+            err && err.message ? err.message : err,
+          );
+          // Count this file's bytes as "done" for the progress bar so one
+          // stuck file can't peg the bar below 100 for the whole sweep.
           completedBytes += fileBytes;
         }
-        this.filesPending = Math.max(0, this.filesPending - 1);
         // Task #1938 — recompute so this project's row moves a file from
         // pending → local the moment the download lands.
         this._recomputeProjectBreakdown();
         this.emitStatus();
+      }
+
+      if (failed > 0) {
+        console.warn(
+          `[SYNC] sweep finished with ${failed} file(s) skipped after errors; the rest synced. They will be retried on the next sweep.`,
+        );
       }
 
       await this._cleanupRemoved(files);
@@ -431,16 +524,13 @@ class SyncEngine extends EventEmitter {
   }
 
   // ---- Instant local scrub source (Task #1766) ----------------------------
-  // Resolve the BEST local scrub source for an asset, preferring the new
-  // all-intra progressive MP4 (`proxy_intra`, every frame an IDR) so the
-  // native <video> element seeks to the exact frame instantly with NO
-  // keyframe-index sidecar and NO WebCodecs/byte-range demuxing. Falls back
-  // to the existing progressive proxy + keyframe-index sidecar when the
-  // all-intra file isn't synced yet, and returns null on every "not here"
-  // path so the web layer cleanly falls back to the network "Quick preview".
+  // Resolve the local scrub source for an asset: the all-intra progressive MP4
+  // (`proxy_intra`, every frame an IDR) so the native <video> element seeks to
+  // the exact frame instantly with NO keyframe-index sidecar and NO WebCodecs/
+  // byte-range demuxing. Returns null on every "not here" path so the web layer
+  // cleanly falls back to the network "Quick preview".
   //
-  // Returns { filePath, scrubSource: 'all-intra' | 'progressive', keyframeIndex }
-  // where keyframeIndex is null for the all-intra source (none required).
+  // Returns { filePath, scrubSource: 'all-intra' } or null.
   resolveLocalScrubSource(assetId) {
     try {
       const id = Number(assetId);
@@ -452,49 +542,15 @@ class SyncEngine extends EventEmitter {
       );
       if (matches.length === 0) return null;
 
-      // 1) Prefer the all-intra progressive MP4 — independently seekable, no
-      //    sidecar needed. Only when the file is actually on disk; if it is in
-      //    the manifest but the download hasn't landed yet we gracefully fall
-      //    through to the progressive proxy below (honest, never a hard error).
+      // The all-intra progressive MP4 is independently seekable, no sidecar
+      // needed. Only when the file is actually on disk; if it is in the
+      // manifest but the download hasn't landed yet we return null so the web
+      // layer falls back to the network preview (honest, never a hard error).
       const intra = matches.find((f) => f && f.proxyKind === "all-intra");
       if (intra) {
         const intraPath = path.join(root, intra.relativePath || intra.name || "");
         if (intraPath && fs.existsSync(intraPath)) {
-          return {
-            filePath: intraPath,
-            scrubSource: "all-intra",
-            keyframeIndex: null,
-          };
-        }
-      }
-
-      // 2) Fall back to the existing progressive proxy + keyframe-index sidecar
-      //    (tolerated until the retire task removes the sidecar path).
-      const progressive = matches.find(
-        (f) => f && (!f.proxyKind || f.proxyKind === "progressive"),
-      );
-      if (progressive) {
-        const proxyPath = path.join(
-          root,
-          progressive.relativePath || progressive.name || "",
-        );
-        if (proxyPath && fs.existsSync(proxyPath)) {
-          const sidecarPath = this._findKeyframeSidecar(proxyPath, progressive);
-          if (sidecarPath && fs.existsSync(sidecarPath)) {
-            let keyframeIndex;
-            try {
-              keyframeIndex = JSON.parse(fs.readFileSync(sidecarPath, "utf8"));
-            } catch (_) {
-              keyframeIndex = null;
-            }
-            if (keyframeIndex && typeof keyframeIndex === "object") {
-              return {
-                filePath: proxyPath,
-                scrubSource: "progressive",
-                keyframeIndex,
-              };
-            }
-          }
+          return { filePath: intraPath, scrubSource: "all-intra" };
         }
       }
 
@@ -502,23 +558,6 @@ class SyncEngine extends EventEmitter {
     } catch (_) {
       return null;
     }
-  }
-
-  // The keyframe-index Lambda writes a JSON sidecar beside the proxy. Accept
-  // either an explicit manifest hint or the conventional sibling names.
-  _findKeyframeSidecar(proxyPath, file) {
-    const candidates = [];
-    if (file && file.keyframeIndexRelativePath) {
-      candidates.push(
-        path.join(this.config.getSyncFolder(), file.keyframeIndexRelativePath),
-      );
-    }
-    const ext = path.extname(proxyPath);
-    const base = ext ? proxyPath.slice(0, -ext.length) : proxyPath;
-    candidates.push(`${proxyPath}.keyframes.json`);
-    candidates.push(`${base}.keyframes.json`);
-    candidates.push(`${base}.keyframe-index.json`);
-    return candidates.find((c) => c && fs.existsSync(c)) || null;
   }
 
   // Download a single manifest file with shared single-flight per destination
@@ -534,7 +573,7 @@ class SyncEngine extends EventEmitter {
       this.config.getSyncFolder(),
       file.relativePath || file.name,
     );
-    if (fs.existsSync(dest) && fs.statSync(dest).size === file.size) {
+    if (this._isFileLocal(dest, file.size)) {
       return { status: "present", dest };
     }
     // Single-flight: if this exact destination is already downloading (from the
@@ -546,12 +585,60 @@ class SyncEngine extends EventEmitter {
       return { status: "coalesced", dest };
     }
     const downloadRoute = file.downloadPath || `/api/sync/download/${file.id}`;
+    const expectedSize = Number(file.size) || 0;
+    // Task #2164 — bounded retry with exponential backoff. A FRESH presigned URL
+    // is requested on every attempt so an expired-link 403 is replaced rather
+    // than retried verbatim. Each downloaded file is integrity-checked against
+    // its expected size; a truncated/corrupt file is discarded and re-fetched,
+    // so it never lands and never counts as "local". Transient failures usually
+    // succeed within a couple of attempts without waiting for the next sweep; a
+    // genuinely-broken object (404) fails fast and stays honestly pending.
     const p = (async () => {
-      const urlRes = await this._json("GET", downloadRoute, null);
-      if (!urlRes?.url) return { status: "no-url", dest };
-      await this._download(urlRes.url, dest, onProgress);
-      await this._json("POST", `/api/sync/download/${file.id}/complete`, {});
-      return { status: "downloaded", dest };
+      let lastErr;
+      for (let attempt = 1; attempt <= this._maxDownloadAttempts; attempt++) {
+        try {
+          const urlRes = await this._json("GET", downloadRoute, null);
+          if (!urlRes?.url) return { status: "no-url", dest };
+          await this._download(urlRes.url, dest, onProgress, expectedSize);
+          // Backstop integrity check (in addition to the in-`_download` guard
+          // before promotion): if the file landed at `dest` but at the wrong
+          // size, discard it and treat as a retryable failure so it never
+          // counts as "local". Only checks a file that actually exists — a
+          // transport that resolves without producing a file is handled by the
+          // primary in-`_download` guard, not here.
+          if (expectedSize > 0 && fs.existsSync(dest)) {
+            const actual = fs.statSync(dest).size;
+            if (actual !== expectedSize) {
+              try {
+                fs.unlinkSync(dest);
+              } catch (_) {}
+              throw new Error(
+                `size-mismatch: expected ${expectedSize}, got ${actual}`,
+              );
+            }
+          }
+          await this._json("POST", `/api/sync/download/${file.id}/complete`, {});
+          return { status: "downloaded", dest };
+        } catch (err) {
+          lastErr = err;
+          // A user pause/cancel is never a transient failure — surface it.
+          if (this.cancelled || (err && /cancelled/i.test(err.message || ""))) {
+            throw err;
+          }
+          if (
+            !this._isRetryableDownloadError(err) ||
+            attempt >= this._maxDownloadAttempts
+          ) {
+            throw err;
+          }
+          console.warn(
+            `[SYNC] transient download failure for "${file.name}" (attempt ${attempt}/${this._maxDownloadAttempts}); retrying:`,
+            err && err.message ? err.message : err,
+          );
+          await this._sleep(this._downloadRetryDelayMs(attempt));
+        }
+      }
+      throw lastErr;
     })();
     this._fileDownloadInflight.set(dest, p);
     try {
@@ -562,7 +649,7 @@ class SyncEngine extends EventEmitter {
   }
 
   // ---- Low-level helpers --------------------------------------------------
-  _download(url, destPath, onProgress) {
+  _download(url, destPath, onProgress, expectedSize = 0) {
     return new Promise((resolve, reject) => {
       if (this.cancelled) return reject(new Error("cancelled"));
       const dir = path.dirname(destPath);
@@ -570,6 +657,7 @@ class SyncEngine extends EventEmitter {
       const tmp = `${destPath}.part`;
       const file = fs.createWriteStream(tmp);
       const proto = url.startsWith("https") ? https : http;
+      const expected = Number(expectedSize) || 0;
 
       const onResponse = (res) => {
         if (res.statusCode === 301 || res.statusCode === 302) {
@@ -597,6 +685,24 @@ class SyncEngine extends EventEmitter {
         file.on("finish", () =>
           file.close(() => {
             try {
+              // Task #2164 — integrity guard: verify the written byte count
+              // against the expected size BEFORE promoting the temp file to its
+              // final name. A truncated/corrupt download (network drop, partial
+              // body) never lands at `destPath`; we delete the temp and reject
+              // with a retryable size-mismatch so the retry loop re-fetches.
+              if (expected > 0) {
+                const actual = fs.statSync(tmp).size;
+                if (actual !== expected) {
+                  try {
+                    fs.unlinkSync(tmp);
+                  } catch (_) {}
+                  return reject(
+                    new Error(
+                      `size-mismatch: expected ${expected}, got ${actual}`,
+                    ),
+                  );
+                }
+              }
               fs.renameSync(tmp, destPath);
               resolve();
             } catch (e) {
