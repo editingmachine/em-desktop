@@ -16,6 +16,9 @@ function initAutoUpdate(notify) {
   autoUpdater.on("update-available", (info) =>
     notify?.({ type: "update-available", version: info?.version }),
   );
+  autoUpdater.on("update-not-available", (info) =>
+    notify?.({ type: "update-not-available", version: info?.version }),
+  );
   autoUpdater.on("update-downloaded", (info) =>
     notify?.({ type: "update-downloaded", version: info?.version }),
   );
@@ -30,8 +33,24 @@ function initAutoUpdate(notify) {
   } catch (_) {}
 }
 
+// Manually trigger an update check (e.g. from the tray "Check for Updates…"
+// item). The result of the check itself is surfaced through the same `notify`
+// callback wired in initAutoUpdate (update-available / update-not-available /
+// update-error). This returns whether the check could be STARTED, so the caller
+// can give immediate feedback when updates aren't possible in this build.
+async function checkForUpdates() {
+  if (!autoUpdater) return { ok: false, reason: "unsupported" };
+  if (process.env.NODE_ENV === "development") return { ok: false, reason: "dev" };
+  try {
+    await autoUpdater.checkForUpdates();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: "error", message: err?.message };
+  }
+}
+
 function quitAndInstall() {
   if (autoUpdater) autoUpdater.quitAndInstall();
 }
 
-module.exports = { initAutoUpdate, quitAndInstall };
+module.exports = { initAutoUpdate, checkForUpdates, quitAndInstall };

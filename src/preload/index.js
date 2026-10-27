@@ -13,6 +13,10 @@ contextBridge.exposeInMainWorld("emSync", {
   resumeSync: () => ipcRenderer.invoke("sync:resume"),
   syncNow: () => ipcRenderer.invoke("sync:now"),
   getStatus: () => ipcRenderer.invoke("sync:status"),
+  getProxyFirstConfig: () => ipcRenderer.invoke("sync:proxy-first"),
+  getLegacyMigrationProjects: () => ipcRenderer.invoke("sync:legacy-projects"),
+  mapLegacyDirectory: (projectId, confirmedProjectCode) =>
+    ipcRenderer.invoke("sync:map-legacy-directory", projectId, confirmedProjectCode),
 
   // Disk + settings
   getDiskInfo: () => ipcRenderer.invoke("disk:info"),

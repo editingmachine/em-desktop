@@ -44,6 +44,11 @@ protocol.registerSchemesAsPrivileged([
 // renderer-supplied file path.
 const proxyPathByAssetId = new Map();
 
+// Task #2463 — latest per-asset download percentage (0-100), kept fresh from the
+// engine's `progress` event so the portal can query/subscribe to a real number
+// for the clip it's waiting on. Cleared when a sweep finishes (nothing syncing).
+const assetSyncProgress = new Map();
+
 // Lookup key for `proxyPathByAssetId`. The Task #1766 scrub-source URL carries
 // a variant segment `em-proxy://asset/<id>/<variant>` (key `<id>/<variant>`) so
 // the all-intra and progressive files for the SAME asset never collide.
@@ -64,10 +69,13 @@ function proxyKeyFromProxyUrl(rawUrl) {
 // 200 for the whole file (still advertising Accept-Ranges), 416 for an
 // unsatisfiable range, or 404 if the file is gone.
 function serveLocalFileWithRange(filePath, rangeHeader) {
+  const release = engine?.acquireLocalRead?.(filePath);
+  if (!release) return new Response(null, { status: 409 });
   let stat;
   try {
     stat = fs.statSync(filePath);
   } catch (_) {
+    release();
     return new Response(null, { status: 404 });
   }
   const total = stat.size;
@@ -79,6 +87,7 @@ function serveLocalFileWithRange(filePath, rangeHeader) {
   const parsed = parseRange(total, rangeHeader);
 
   if (parsed.kind === "unsatisfiable") {
+    release();
     return new Response(null, {
       status: 416,
       headers: { ...baseHeaders, "Content-Range": `bytes */${total}` },
@@ -87,7 +96,10 @@ function serveLocalFileWithRange(filePath, rangeHeader) {
 
   if (parsed.kind === "range") {
     const { start, end } = parsed;
-    const body = Readable.toWeb(fs.createReadStream(filePath, { start, end }));
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.once("close", release);
+    stream.once("error", release);
+    const body = Readable.toWeb(stream);
     return new Response(body, {
       status: 206,
       headers: {
@@ -99,7 +111,10 @@ function serveLocalFileWithRange(filePath, rangeHeader) {
   }
 
   // Whole file.
-  const body = Readable.toWeb(fs.createReadStream(filePath));
+  const stream = fs.createReadStream(filePath);
+  stream.once("close", release);
+  stream.once("error", release);
+  const body = Readable.toWeb(stream);
   return new Response(body, {
     status: 200,
     headers: { ...baseHeaders, "Content-Length": String(total) },
@@ -112,7 +127,23 @@ const { getDiskUsage } = require("../daemon/disk");
 const { SyncEngine, DEFAULT_API_BASE } = require("../daemon/sync-engine");
 const { setAutoLaunch, getAutoLaunch } = require("./auto-launch");
 const { deriveSyncState, SYNC_LABELS } = require("../shared/sync-state");
-const { initAutoUpdate, quitAndInstall } = require("./updater");
+const { initAutoUpdate, checkForUpdates, quitAndInstall } = require("./updater");
+// True while a user-initiated "Check for Updates…" is awaiting its result, so
+// the auto-update notify handler knows to surface a dialog (the background
+// 6-hourly check stays silent). A safety timer guarantees the flag can never
+// stick true if no terminal update event ever arrives (e.g. an early click
+// before listeners attach, or a dropped check), which would otherwise lock the
+// menu item out permanently.
+let manualCheckInProgress = false;
+let manualCheckTimer = null;
+
+function endManualCheck() {
+  manualCheckInProgress = false;
+  if (manualCheckTimer) {
+    clearTimeout(manualCheckTimer);
+    manualCheckTimer = null;
+  }
+}
 
 const PORTAL_URL = process.env.EM_PORTAL_URL || DEFAULT_API_BASE;
 
@@ -232,8 +263,36 @@ function buildTrayMenu() {
       : { label: "Pause Sync", click: () => engine.pause() },
     { label: "Sync Now", click: () => engine?.syncOnce().catch(() => {}) },
     { type: "separator" },
+    { label: "Check for Updates…", click: () => checkForUpdatesManual() },
     { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
   ]);
+}
+
+// Tray "Check for Updates…" handler. Kicks off a check and gives the user
+// immediate feedback. The actual result (available / up-to-date / error) is
+// surfaced by the initAutoUpdate notify handler while manualCheckInProgress.
+async function checkForUpdatesManual() {
+  if (manualCheckInProgress) return;
+  manualCheckInProgress = true;
+  // Fail-safe: drop the flag after 60s even if no terminal event arrives.
+  manualCheckTimer = setTimeout(endManualCheck, 60_000);
+  const res = await checkForUpdates();
+  if (!res.ok) {
+    endManualCheck();
+    const detail =
+      res.reason === "dev"
+        ? "Updates are disabled in development builds."
+        : res.reason === "unsupported"
+          ? "Automatic updates aren't available in this build."
+          : res.message || "Couldn't check for updates right now. Please try again later.";
+    await dialog.showMessageBox({
+      type: res.reason === "error" ? "error" : "info",
+      buttons: ["OK"],
+      title: "Check for Updates",
+      message: "Editing Machine Sync",
+      detail,
+    });
+  }
 }
 
 function refreshTray() {
@@ -257,10 +316,28 @@ function wireEngine() {
     refreshTray();
     controlWindow?.webContents.send("status:update", status);
   });
-  engine.on("progress", (p) => controlWindow?.webContents.send("sync:progress", p));
+  engine.on("progress", (p) => {
+    controlWindow?.webContents.send("sync:progress", p);
+    // Task #2463 — remember + forward the per-asset download percentage so the
+    // portal (web app) can show a real "downloading NN%" number on the preview
+    // overlay for the exact clip under the playhead. The control window keeps
+    // reading the batch-level `p` above unchanged.
+    const id = Number(p?.assetId);
+    const pct = Number(p?.filePct);
+    if (Number.isFinite(id) && id > 0 && Number.isFinite(pct)) {
+      assetSyncProgress.set(id, Math.max(0, Math.min(100, Math.round(pct))));
+      portalWindow?.webContents.send("em-proxy:sync-progress", { assetId: id, pct: assetSyncProgress.get(id) });
+    }
+  });
+  // Task #2463 — a completed sweep means nothing is actively downloading, so
+  // drop stale per-asset progress; a fresh sweep repopulates it.
+  engine.on("status", (status) => {
+    if (status?.state && status.state !== "syncing") assetSyncProgress.clear();
+  });
   engine.on("error", (err) =>
     controlWindow?.webContents.send("sync:error", { message: err?.message }),
   );
+  engine.on("local-paths-invalidated", () => proxyPathByAssetId.clear());
 }
 
 // ---- IPC bridge (see preload/index.js) ------------------------------------
@@ -289,6 +366,40 @@ function registerIpc() {
   // per-project breakdown) via the engine's single snapshot builder, so the
   // initial fetch and live updates never disagree.
   ipcMain.handle("sync:status", () => engine.getStatusSnapshot());
+  ipcMain.handle("sync:proxy-first", async () => {
+    if (!engine) return { enabled: false, version: 1, reason: "not_ready" };
+    return engine.getProxyFirstConfig();
+  });
+  ipcMain.handle("sync:legacy-projects", async () => {
+    if (!engine?.token) throw new Error("Sign in before identifying a legacy project folder");
+    const manifest = await engine._json("GET", "/api/sync/manifest?version=2", null);
+    if (manifest?.version !== 2 || manifest.complete !== true ||
+        manifest.accountId !== engine.user?.id || !Array.isArray(manifest.projects)) {
+      throw new Error("Unable to load authoritative projects; no files were changed");
+    }
+    return manifest.projects.map(({ projectId, projectCode, projectName }) =>
+      ({ projectId, projectCode, projectName }));
+  });
+  ipcMain.handle("sync:map-legacy-directory", async (_event, projectId, confirmedProjectCode) => {
+    if (!Number.isSafeInteger(projectId) || projectId <= 0 || typeof confirmedProjectCode !== "string") {
+      throw new Error("Select a project and confirm its existing project number");
+    }
+    const root = path.resolve(cfg.getSyncFolder());
+    const userId = engine.user?.id;
+    const selected = await dialog.showOpenDialog({
+      title: "Select the old project folder — not the client or sync root",
+      defaultPath: root,
+      properties: ["openDirectory"],
+    });
+    if (selected.canceled || !selected.filePaths[0]) return { cancelled: true };
+    if (root !== path.resolve(cfg.getSyncFolder()) || userId !== engine.user?.id || !engine.token) {
+      throw new Error("Account or sync folder changed. Select the folder again.");
+    }
+    const relative = path.relative(root, selected.filePaths[0]).split(path.sep).join("/");
+    await engine.mapLegacyDirectory(projectId, relative, confirmedProjectCode);
+    proxyPathByAssetId.clear();
+    return { success: true };
+  });
 
   ipcMain.handle("disk:info", () => getDiskUsage(cfg.getSyncFolder()));
 
@@ -297,15 +408,18 @@ function registerIpc() {
     syncInterval: cfg.config.get("syncInterval") || 5,
     autoStart: getAutoLaunch(),
     selectedClients: cfg.config.get("selectedClients") || [],
-    cleanupRemoved: cfg.config.get("cleanupRemoved") || false,
+    cleanupRemoved: false,
+    projectStorageNoticeAcknowledged: cfg.config.get("projectStorageNoticeAcknowledged") === true,
     apiBase: PORTAL_URL,
     usingKeychain: keychain.usingKeychain,
   }));
   ipcMain.handle("settings:update", (_e, s) => {
     if (s.syncInterval) cfg.config.set("syncInterval", Number(s.syncInterval));
     if (s.selectedClients) cfg.config.set("selectedClients", s.selectedClients);
-    if (typeof s.cleanupRemoved === "boolean") cfg.config.set("cleanupRemoved", s.cleanupRemoved);
     if (typeof s.autoStart === "boolean") setAutoLaunch(s.autoStart);
+    if (typeof s.projectStorageNoticeAcknowledged === "boolean") {
+      cfg.config.set("projectStorageNoticeAcknowledged", s.projectStorageNoticeAcknowledged);
+    }
     return true;
   });
   ipcMain.handle("app:chooseSyncFolder", async () => {
@@ -338,6 +452,17 @@ function registerIpc() {
     }
   });
 
+  // Task #2463 — pull the latest download percentage for an asset. Push events
+  // (`em-proxy:sync-progress`) drive the smooth live update; this query is the
+  // fallback so a surface mounting mid-download shows the current number
+  // immediately. Returns null when nothing is downloading for that asset.
+  ipcMain.handle("em-proxy:getSyncProgress", (_e, assetId) => {
+    const id = Number(assetId);
+    if (!Number.isFinite(id) || id <= 0) return null;
+    const pct = assetSyncProgress.get(id);
+    return typeof pct === "number" ? pct : null;
+  });
+
   // Task #1766 — instant local scrub source: the all-intra progressive MP4
   // (frame-exact native <video> seeks, no sidecar). Returns the resolved
   // `scrubSource` so the preview monitor can show an honest indicator. Returns
@@ -348,6 +473,7 @@ function registerIpc() {
       if (!Number.isFinite(id) || id <= 0) return null;
       const resolved = engine?.resolveLocalScrubSource(id);
       if (!resolved || !resolved.filePath) return null;
+      if (!engine.isLocalPathAvailable?.(resolved.filePath)) return null;
       proxyPathByAssetId.set(`${id}/intra`, resolved.filePath);
       return {
         proxyUrl: `em-proxy://asset/${id}/intra`,
@@ -395,7 +521,7 @@ if (!gotLock) {
     protocol.handle("em-proxy", (request) => {
       const key = proxyKeyFromProxyUrl(request.url);
       const filePath = key ? proxyPathByAssetId.get(key) : null;
-      if (!filePath) return new Response(null, { status: 404 });
+      if (!filePath || !engine?.isLocalPathAvailable?.(filePath)) return new Response(null, { status: 404 });
       return serveLocalFileWithRange(filePath, request.headers.get("range"));
     });
 
@@ -410,9 +536,52 @@ if (!gotLock) {
 
     initAutoUpdate(async (evt) => {
       controlWindow?.webContents.send("update:event", evt);
+
+      // Surface results of a user-initiated "Check for Updates…" via a dialog.
+      // The background 6-hourly check leaves manualCheckInProgress false, so it
+      // stays silent (only the update-downloaded prompt below fires for it).
+      if (manualCheckInProgress) {
+        if (evt?.type === "update-not-available") {
+          endManualCheck();
+          await dialog.showMessageBox({
+            type: "info",
+            buttons: ["OK"],
+            title: "Check for Updates",
+            message: "You're up to date.",
+            detail: `Editing Machine Sync ${app.getVersion()} is the latest version.`,
+          });
+          return;
+        }
+        if (evt?.type === "update-available") {
+          endManualCheck();
+          await dialog.showMessageBox({
+            type: "info",
+            buttons: ["OK"],
+            title: "Update available",
+            message: `Editing Machine Sync ${evt.version || ""} is available.`.trim(),
+            detail: "It's downloading now — you'll be prompted to restart once it's ready.",
+          });
+          // fall through: let the download continue.
+        }
+        if (evt?.type === "update-error") {
+          endManualCheck();
+          await dialog.showMessageBox({
+            type: "error",
+            buttons: ["OK"],
+            title: "Check for Updates",
+            message: "Couldn't check for updates",
+            detail: evt.message || "Please try again later.",
+          });
+          return;
+        }
+      }
+
       // When a new version finishes downloading, prompt to restart & install.
       // (electron-updater also auto-installs on the next quit if they pick Later.)
       if (evt?.type === "update-downloaded") {
+        // Clear any in-flight manual check (the download may finish without us
+        // having observed update-available, e.g. an already-staged update).
+        endManualCheck();
         const { response } = await dialog.showMessageBox({
           type: "info",
           buttons: ["Restart now", "Later"],

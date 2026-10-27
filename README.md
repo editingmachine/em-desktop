@@ -93,6 +93,45 @@ committed:
 
 ### Auto-update
 
+#### Deleted Smart Cloud downloads — desktop 1.0.3
+
+This source change first ships in **desktop 1.0.3**. It has not released any
+installers or cleaned any production PCs. A website Publish alone does **not**
+update installed desktop apps. Use the existing native installer/release
+pipeline above; operators then use tray **Check for Updates…**, accept the
+downloaded update and restart, or install the platform's 1.0.3 installer from
+the approved release. The existing feed must actually contain that release.
+
+The server requires the additive schema and trigger migration
+`migrations/0394_desktop_cloud_deletions.sql`. It follows the normal development
+post-merge migration process; include its custom trigger/function in the
+owner-reviewed production migration/Publish process. Schema column sync alone
+does not install PostgreSQL trigger bodies. Never run this DDL at app startup.
+Until the matching server contract is available, desktops retain files.
+
+Only new, positively journalled downloads carrying a source generation can be
+removed automatically. Older downloads cannot be retroactively claimed from
+their names or sizes: the dashboard explains how to preserve them outside sync
+and remove them manually. Client originals and operator-added/modified files
+are never removed by this feature.
+Downloaded operator recovery copies under `operator-uploads/` are also protected,
+even if an older journal already stamped them with a source generation. Their
+retained status is explicit; only the separate verified-coverage project-folder
+retirement process may retire those bytes.
+
+The next normal sync (default five minutes), Sync Now, resume or restart checks
+all known copies against bounded authoritative receipt queries. Receipts have
+no expiry and there is no deletion cursor: a long-offline desktop uses the same
+exact-identity reconciliation, never a snapshot-absence inference. Paused,
+offline or closed desktops cannot delete immediately. Active playback and
+locked files are retried on later syncs. Changes to selection, permissions,
+account, session or root retain files.
+
+The receipt journals only the exact intentionally removed download. Folder
+retirement still requires verified cloud coverage for every remaining local
+file, including manual and modified files. Mere project detachment, temporary
+manifest omissions and derivative replacements are not global deletions.
+
 `electron-updater` is wired in `src/main/updater.js` and the feed is configured in
 `electron-builder.yml` (`publish:` → GitHub releases by default). Change
 `owner`/`repo` (or switch to a generic URL provider) before the first release.

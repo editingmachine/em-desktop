@@ -1,6 +1,6 @@
 {
   "name": "em-desktop",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Editing Machine desktop shell — portal window + background file-sync daemon",
   "author": "Editing Machine",
   "main": "src/main/index.js",
@@ -16,7 +16,8 @@
   "dependencies": {
     "auto-launch": "^5.0.6",
     "conf": "^10.2.0",
-    "electron-updater": "^6.1.7"
+    "electron-updater": "^6.8.9",
+    "sprintf-js": "file:../vendor/editingmachine-bounded-sprintf-1.0.0.tgz"
   },
   "devDependencies": {
     "@types/react": "^18.2.0",
@@ -24,14 +25,32 @@
     "@vitejs/plugin-react": "^4.2.0",
     "concurrently": "^8.2.2",
     "cross-env": "^7.0.3",
-    "electron": "^30.0.0",
-    "electron-builder": "^24.13.3",
+    "electron": "^41.10.7",
+    "electron-builder": "^26.15.3",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "typescript": "^5.4.0",
-    "vite": "^5.2.0"
+    "vite": "^6.4.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.22.0"
+  },
+  "overrides": {
+    "sprintf-js": "$sprintf-js",
+    "@xmldom/xmldom": "^0.8.15",
+    "nanoid@^3": "^3.3.18",
+    "undici@^6": "^6.28.1",
+    "tar": "^7.5.19",
+    "http-cache-semantics": "^4.3.0",
+    "brace-expansion@^1": "^1.1.21",
+    "brace-expansion@^2": "^2.1.7",
+    "brace-expansion@>=4": "^5.0.12",
+    "fast-uri": "^3.1.8",
+    "js-yaml@^4": "^4.3.2",
+    "source-map-js": "^1.2.2",
+    "shell-quote": "^1.11.0",
+    "@babel/core": "^7.29.6",
+    "browserslist": "^4.28.7",
+    "baseline-browser-mapping": "^2.11.0"
   }
 }

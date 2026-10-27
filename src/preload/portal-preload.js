@@ -21,4 +21,22 @@ contextBridge.exposeInMainWorld("emProxy", {
   // was just added to the timeline). Fire-and-forget + coalesced in main.
   triggerImmediateSync: (assetId) =>
     ipcRenderer.invoke("em-proxy:triggerImmediateSync", assetId),
+  // Task #2463 — real download progress for the clip the preview is waiting on.
+  // `getSyncProgress` pulls the latest percentage (0-100, or null when not
+  // downloading); `onSyncProgress` pushes live per-asset updates so the overlay
+  // shows a smooth, honest number instead of a generic "downloading" message.
+  // The subscribe wrapper returns an unsubscribe fn and never leaks ipcRenderer.
+  getSyncProgress: (assetId) =>
+    ipcRenderer.invoke("em-proxy:getSyncProgress", assetId),
+  onSyncProgress: (cb) => {
+    const handler = (_e, payload) => {
+      try {
+        cb(payload);
+      } catch (_) {
+        /* a subscriber throwing must never break the IPC channel */
+      }
+    };
+    ipcRenderer.on("em-proxy:sync-progress", handler);
+    return () => ipcRenderer.removeListener("em-proxy:sync-progress", handler);
+  },
 });

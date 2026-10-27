@@ -8,6 +8,9 @@ import { SyncEngine } from "./sync-engine.js";
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeEngine() {
+  const fs = require("fs");
+  const path = require("path");
+  const root = fs.mkdtempSync(path.join(require("os").tmpdir(), "em-sync-test-1920-"));
   const store = new Map([["selectedClients", []]]);
   const config = {
     config: {
@@ -15,7 +18,7 @@ function makeEngine() {
       set: (k, v) => store.set(k, v),
       delete: (k) => store.delete(k),
     },
-    getSyncFolder: () => "/tmp/em-sync-test-1920",
+    getSyncFolder: () => root,
   };
   const engine = new SyncEngine({
     apiBase: "http://test.local",
@@ -34,7 +37,7 @@ function makeEngine() {
   };
 
   engine._json = vi.fn(async (method, route) => {
-    if (route === "/api/sync/manifest") return manifest;
+    if (route === "/api/sync/manifest?version=2") return manifest;
     if (route.endsWith("/complete")) return {};
     if (route.startsWith("/api/sync/download/")) return { url: `http://files/${route}` };
     return {};
@@ -46,6 +49,7 @@ function makeEngine() {
   engine._download = vi.fn(async (_url, destPath) => {
     downloadCalls.set(destPath, (downloadCalls.get(destPath) || 0) + 1);
     await delay(40);
+    fs.writeFileSync(destPath, Buffer.alloc(destPath.endsWith(".scrub.mp4") ? 50 : 100));
   });
 
   return { engine, downloadCalls };
@@ -131,7 +135,7 @@ describe("SyncEngine per-project breakdown (Task #1938)", () => {
     fs.writeFileSync(path.join(root, "alpha", "a1.mp4"), Buffer.alloc(10));
 
     engine._json = vi.fn(async (method, route) => {
-      if (route === "/api/sync/manifest") return manifest;
+      if (route === "/api/sync/manifest?version=2") return manifest;
       if (route.endsWith("/complete")) return {};
       if (route.startsWith("/api/sync/download/")) return { url: `http://files/${route}` };
       return {};
@@ -240,7 +244,7 @@ describe("SyncEngine sweep resilience to a single failing file", () => {
       ],
     };
     engine._json = vi.fn(async (method, route) => {
-      if (route === "/api/sync/manifest") return manifest;
+      if (route === "/api/sync/manifest?version=2") return manifest;
       if (route.endsWith("/complete")) return {};
       if (route.startsWith("/api/sync/download/")) return { url: `http://files/${route}` };
       return {};
@@ -287,7 +291,7 @@ describe("SyncEngine sweep resilience to a single failing file", () => {
       ],
     };
     engine._json = vi.fn(async (method, route) => {
-      if (route === "/api/sync/manifest") return manifest;
+      if (route === "/api/sync/manifest?version=2") return manifest;
       if (route.endsWith("/complete")) return {};
       // Asset 2's download endpoint returns no url (e.g. asset has no stored file).
       if (route.startsWith("/api/sync/download/2")) return {};
@@ -337,7 +341,7 @@ describe("SyncEngine download reliability (Task #2164)", () => {
     engine._sleep = vi.fn(async () => {}); // instant backoff in tests
     let urlFetches = 0;
     engine._json = vi.fn(async (method, route) => {
-      if (route === "/api/sync/manifest") return { files: manifestFiles };
+      if (route === "/api/sync/manifest?version=2") return { files: manifestFiles };
       if (route.endsWith("/complete")) return {};
       if (route.startsWith("/api/sync/download/")) {
         urlFetches++;

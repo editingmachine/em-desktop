@@ -15,6 +15,7 @@ const path = require("path");
 const https = require("https");
 const http = require("http");
 const { EventEmitter } = require("events");
+const { ProjectSync, safePath } = require("./project-sync");
 
 const DEFAULT_API_BASE =
   process.env.EM_API_URL || "https://editingmachine.app";
@@ -43,6 +44,21 @@ class SyncEngine extends EventEmitter {
     // flag is layered on at emit time (see getStatusSnapshot) so a pause can't
     // leave a stale "downloading" marker baked into the array.
     this.projectBreakdown = [];
+    this.projectSync = new ProjectSync(this);
+    this.resourcesPath = opts.resourcesPath || process.resourcesPath || require("path").resolve(__dirname, "../..");
+    // Server-controlled rollout contract.  This is intentionally independent
+    // of local preferences: a desktop build must never self-enable proxy-first
+    // uploads or claim that a proxy is render-ready.
+    this.proxyFirst = {
+      enabled: false,
+      version: 1,
+      reason: "not_checked",
+      formats: [],
+      codecs: [],
+      requiresPackagedConverter: true,
+      originalsRequiredForRender: true,
+    };
+    this._syncSerial = Promise.resolve();
     this._timer = null;
     // Task #1758 — last manifest's file list, kept so the local-proxy
     // bridge can map an assetId back to a synced file on disk. Best-effort:
@@ -146,6 +162,7 @@ class SyncEngine extends EventEmitter {
       filesSynced: this.filesSynced,
       filesPending: this.filesPending,
       projects,
+      projectSync: this.projectSync.snapshot(),
       user: this.user ? { email: this.user.email, name: this.user.name } : null,
     };
   }
@@ -185,7 +202,28 @@ class SyncEngine extends EventEmitter {
   async restoreSession() {
     this.token = await this.keychain.getSecret();
     this.user = this.config.config.get("user") || null;
+    if (this.token) await this.getProxyFirstConfig();
     return !!this.token;
+  }
+
+  async getProxyFirstConfig() {
+    if (!this.token) {
+      this.proxyFirst = { ...this.proxyFirst, reason: "not_authenticated" };
+      return this.proxyFirst;
+    }
+    try {
+      const config = await this._json("GET", "/api/sync/proxy-first", null);
+      if (!config || config.version !== 1 || typeof config.enabled !== "boolean" ||
+          !Array.isArray(config.formats) || !Array.isArray(config.codecs) ||
+          config.originalsRequiredForRender !== true) {
+        throw new Error("Invalid proxy-first rollout contract");
+      }
+      this.proxyFirst = config;
+    } catch (_) {
+      // Fail closed and retain the original-first sync contract.
+      this.proxyFirst = { ...this.proxyFirst, enabled: false, reason: "contract_unavailable" };
+    }
+    return this.proxyFirst;
   }
 
   authHeaders() {
@@ -211,6 +249,7 @@ class SyncEngine extends EventEmitter {
     this.user = res.user;
     await this.keychain.setSecret(res.authToken);
     this.config.config.set("user", res.user);
+    await this.getProxyFirstConfig();
     await this.registerDevice();
     this.emitStatus();
     return res.user;
@@ -223,6 +262,7 @@ class SyncEngine extends EventEmitter {
     } catch (_) {}
     this.token = null;
     this.user = null;
+    this.proxyFirst = { ...this.proxyFirst, enabled: false, reason: "not_authenticated" };
     await this.keychain.clearSecret();
     this.config.config.delete("user");
     this.state = "idle";
@@ -281,12 +321,15 @@ class SyncEngine extends EventEmitter {
   }
 
   stop() {
+    this.projectSync.cancelTransfers();
+    this.projectSync.close();
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
     this.cancelled = true;
   }
 
   pause() {
+    this.projectSync.cancelTransfers();
     this.paused = true;
     this.cancelled = true; // abort in-flight download
     this.state = "paused";
@@ -301,7 +344,50 @@ class SyncEngine extends EventEmitter {
     this.syncOnce().catch((e) => this.emit("error", e));
   }
 
-  async syncOnce() {
+  _serializeSync(fn) {
+    const run = this._syncSerial.then(fn);
+    this._syncSerial = run.catch(() => {});
+    return run;
+  }
+
+  syncOnce() {
+    return this._serializeSync(() => this._syncOnce());
+  }
+
+  isLocalPathAvailable(filePath) {
+    try {
+      if (this._projectMutation || this.projectSync.data && this.projectSync.context() !== this.projectSync.scope) return false;
+      const root = this.config.getSyncFolder();
+      const relative = path.relative(root, filePath).split(path.sep).join("/");
+      safePath(root, relative);
+      if (this.projectSync.deletedDownloads.blocks(relative)) return false;
+      return !Object.values(this.projectSync.data?.projects || {}).some((p) =>
+        p.fencedDirectory && (relative.startsWith(p.relativeDirectory + "/") || relative.startsWith(p.fencedDirectory + "/")));
+    } catch (_) { return false; }
+  }
+
+  acquireLocalRead(filePath) {
+    if (!this.isLocalPathAvailable(filePath)) return null;
+    const key = path.resolve(filePath);
+    const readers = this.projectSync.readers;
+    readers.set(key, (readers.get(key) || 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      readers.set(key, Math.max(0, (readers.get(key) || 0) - 1));
+    };
+  }
+
+  mapLegacyDirectory(projectId, relativeDirectory, confirmedProjectCode) {
+    return this._serializeSync(async () => {
+      const result = await this.projectSync.mapLegacyDirectory(projectId, relativeDirectory, confirmedProjectCode);
+      await this._syncOnce();
+      return result;
+    });
+  }
+
+  async _syncOnce() {
     if (this.paused || !this.token) return { downloaded: 0 };
     this.state = "syncing";
     this.emitStatus();
@@ -309,10 +395,16 @@ class SyncEngine extends EventEmitter {
     let downloaded = 0;
     try {
       const selected = this.config.config.get("selectedClients") || [];
-      const manifest = await this._json("GET", "/api/sync/manifest", null);
-      const files = (manifest?.files || []).filter((f) =>
-        selected.length === 0 ? true : selected.includes(f.clientId),
-      );
+      const manifest = await this._json("GET", "/api/sync/manifest?version=2", null);
+      if (!manifest || !Array.isArray(manifest.files)) throw new Error("Invalid sync manifest; files retained");
+      if (manifest.version === 2) await this.projectSync.reconcile(manifest);
+      const files = (manifest?.files || []).filter((f) => {
+        if (this.projectSync.deletedDownloads.deleted(f)) return false;
+        safePath(this.config.getSyncFolder(), f.relativePath || f.name);
+        const p = manifest.projects?.find((p) => p.projectId === f.projectId);
+        return (!p || !["approved", "archive", "archived"].includes(p.status) && p.lifecycleState !== "archived") &&
+          (selected.length === 0 || selected.includes(f.clientId));
+      });
       this.lastFiles = files;
 
       this.filesPending = files.length;
@@ -385,7 +477,18 @@ class SyncEngine extends EventEmitter {
                   )
                 : filePct;
             lastPct = Math.max(lastPct, raw);
-            this.emit("progress", { file: file.name, pct: lastPct, bytes: file.size });
+            // Task #2463 — carry the per-ASSET, per-FILE percentage alongside the
+            // batch aggregate. `pct`/`file`/`bytes` are the whole-batch fields the
+            // control window's dashboard already reads (unchanged). `assetId` +
+            // `filePct` let the portal surface a real "downloading 42%" number for
+            // the exact clip under the playhead instead of a generic message.
+            this.emit("progress", {
+              file: file.name,
+              pct: lastPct,
+              bytes: file.size,
+              assetId: file.id,
+              filePct: Math.max(0, Math.min(100, Math.round(filePct || 0))),
+            });
           });
           // "coalesced" = a trigger fetched this same file while we were
           // sweeping; it's on disk now, so still advance the batch but don't
@@ -459,7 +562,7 @@ class SyncEngine extends EventEmitter {
     const key = String(id);
     const existing = this._assetSyncInflight.get(key);
     if (existing) return existing;
-    const p = this._syncAssetInner(id).finally(() => {
+    const p = this._serializeSync(() => this._syncAssetInner(id)).finally(() => {
       this._assetSyncInflight.delete(key);
     });
     this._assetSyncInflight.set(key, p);
@@ -470,15 +573,17 @@ class SyncEngine extends EventEmitter {
     let downloaded = 0;
     try {
       const selected = this.config.config.get("selectedClients") || [];
-      const manifest = await this._json("GET", "/api/sync/manifest", null);
+      const manifest = await this._json("GET", "/api/sync/manifest?version=2", null);
+      if (manifest?.version === 2) await this.projectSync.reconcile(manifest);
       const allFiles = (manifest?.files || []).filter((f) =>
-        selected.length === 0 ? true : selected.includes(f.clientId),
+        !this.projectSync.deletedDownloads.deleted(f) && (selected.length === 0 || selected.includes(f.clientId)),
       );
       // Keep lastFiles fresh so resolveLocalScrubSource can map the asset's
       // files to disk as soon as the on-demand download lands.
       this.lastFiles = allFiles;
 
-      const files = allFiles.filter((f) => Number(f && f.id) === id);
+      const files = allFiles.filter((f) => Number(f && f.id) === id && !manifest.projects?.some((p) =>
+        p.projectId === f.projectId && (p.retired || ["approved", "archive", "archived"].includes(p.status) || p.lifecycleState === "archived")));
       for (const file of files) {
         if (this.paused || this.cancelled) break;
         // Task #1920 — shared single-flight: if the periodic sweep (or an
@@ -503,24 +608,8 @@ class SyncEngine extends EventEmitter {
 
   // Remove local files that no longer exist in the manifest (best-effort).
   async _cleanupRemoved(files) {
-    try {
-      const wanted = new Set(
-        files.map((f) => path.join(this.config.getSyncFolder(), f.relativePath || f.name)),
-      );
-      const root = this.config.getSyncFolder();
-      const walk = (dir) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const full = path.join(dir, entry.name);
-          if (entry.isDirectory()) walk(full);
-          else if (!wanted.has(full)) {
-            try {
-              fs.unlinkSync(full);
-            } catch (_) {}
-          }
-        }
-      };
-      if (fs.existsSync(root) && this.config.config.get("cleanupRemoved")) walk(root);
-    } catch (_) {}
+    // Never remove unlisted files: operator bytes are not manifest-owned.
+    return;
   }
 
   // ---- Instant local scrub source (Task #1766) ----------------------------
@@ -549,7 +638,7 @@ class SyncEngine extends EventEmitter {
       const intra = matches.find((f) => f && f.proxyKind === "all-intra");
       if (intra) {
         const intraPath = path.join(root, intra.relativePath || intra.name || "");
-        if (intraPath && fs.existsSync(intraPath)) {
+        if (intraPath && this.isLocalPathAvailable(intraPath) && fs.existsSync(intraPath)) {
           return { filePath: intraPath, scrubSource: "all-intra" };
         }
       }
@@ -569,10 +658,26 @@ class SyncEngine extends EventEmitter {
   //   { status: "no-url" }      — server returned no presigned URL
   // Honours pause/cancel via the underlying `_download`.
   async _downloadFileTracked(file, onProgress) {
-    const dest = path.join(
+    if (this.projectSync.deletedDownloads.deleted(file)) return { status: "cloud-deleted" };
+    const transferScope = { token: this.token, user: this.user?.id,
+      root: this.config.getSyncFolder(), selected: JSON.stringify(this.config.config.get("selectedClients") || []) };
+    const checkTransfer = () => {
+      if (this.paused || this.cancelled || transferScope.token !== this.token || transferScope.user !== this.user?.id ||
+          transferScope.root !== this.config.getSyncFolder() ||
+          transferScope.selected !== JSON.stringify(this.config.config.get("selectedClients") || []))
+        throw new Error("Download cancelled: account, session, root or selection changed");
+    };
+    const dest = safePath(
       this.config.getSyncFolder(),
       file.relativePath || file.name,
     );
+    if (!this.isLocalPathAvailable(dest)) throw new Error("Project path fenced for retirement");
+    if (fs.existsSync(dest) && this.projectSync.data) {
+      const known = this.projectSync.data.downloads[file.relativePath || file.name];
+      const { fingerprint } = require("./project-sync");
+      if (!known || known.sha256 !== fingerprint(dest).sha256)
+        return { status: "present", dest }; // preserve operator edits/unclaimed bytes
+    }
     if (this._isFileLocal(dest, file.size)) {
       return { status: "present", dest };
     }
@@ -598,8 +703,31 @@ class SyncEngine extends EventEmitter {
       for (let attempt = 1; attempt <= this._maxDownloadAttempts; attempt++) {
         try {
           const urlRes = await this._json("GET", downloadRoute, null);
+          checkTransfer();
           if (!urlRes?.url) return { status: "no-url", dest };
-          await this._download(urlRes.url, dest, onProgress, expectedSize);
+          if (file.generation && !file.desktopRecovery && file.kind !== "desktop_recovery" &&
+              urlRes.generation !== file.generation)
+            throw new Error("Download cancelled: source generation changed");
+          if (file.generation) {
+            const source = await this._json("GET", `/api/sync/download/${file.id}/identity`, null);
+            checkTransfer();
+            if (source.generation !== file.generation) throw new Error("Download cancelled: source generation changed");
+          }
+          await this._download(urlRes.url, dest, onProgress, expectedSize, async () => {
+            checkTransfer();
+            if (file.generation) {
+              const source = await this._json("GET", `/api/sync/download/${file.id}/identity`, null);
+              checkTransfer();
+              if (source.generation !== file.generation) throw new Error("Download cancelled: source generation changed");
+            }
+          });
+          if (file.sha256 && fs.existsSync(dest)) {
+            const actual = require("./project-sync").fingerprint(dest);
+            if (actual.sha256 !== file.sha256) {
+              fs.unlinkSync(dest);
+              throw new Error("sha256-mismatch: downloaded recovery bytes do not match manifest");
+            }
+          }
           // Backstop integrity check (in addition to the in-`_download` guard
           // before promotion): if the file landed at `dest` but at the wrong
           // size, discard it and treat as a retryable failure so it never
@@ -617,10 +745,27 @@ class SyncEngine extends EventEmitter {
               );
             }
           }
+          checkTransfer();
+          if (fs.existsSync(dest)) this.projectSync.recordDownload(file.relativePath || file.name, file);
+          if (file.generation) {
+            const source = await this._json("GET", `/api/sync/download/${file.id}/identity`, null);
+            checkTransfer();
+            if (source.generation !== file.generation) throw new Error("Download cancelled: source generation changed");
+          }
           await this._json("POST", `/api/sync/download/${file.id}/complete`, {});
           return { status: "downloaded", dest };
         } catch (err) {
           lastErr = err;
+          // Deletion during transfer is not a client-facing transfer warning.
+          // Only an explicit, current receipt may settle this attempt.
+          if (file.generation && !this.paused && !this.cancelled && this.projectSync.data) {
+            try {
+              checkTransfer();
+              const [receipt] = await this.projectSync.deletedDownloads.authority([file]);
+              checkTransfer();
+              if (receipt.deleted) return { status: "cloud-deleted", dest };
+            } catch (_) { /* no authority: retain normal download failure semantics */ }
+          }
           // A user pause/cancel is never a transient failure — surface it.
           if (this.cancelled || (err && /cancelled/i.test(err.message || ""))) {
             throw err;
@@ -649,13 +794,19 @@ class SyncEngine extends EventEmitter {
   }
 
   // ---- Low-level helpers --------------------------------------------------
-  _download(url, destPath, onProgress, expectedSize = 0) {
+  _download(url, destPath, onProgress, expectedSize = 0, beforePromote) {
     return new Promise((resolve, reject) => {
       if (this.cancelled) return reject(new Error("cancelled"));
       const dir = path.dirname(destPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       const tmp = `${destPath}.part`;
-      const file = fs.createWriteStream(tmp);
+      let tempFd;
+      try {
+        safePath(this.config.getSyncFolder(), path.relative(this.config.getSyncFolder(), tmp).split(path.sep).join("/"));
+        tempFd = fs.openSync(tmp, "wx");
+      } catch (e) { return reject(e); }
+      const tempIno = fs.fstatSync(tempFd).ino;
+      const file = fs.createWriteStream(tmp, { fd: tempFd });
       const proto = url.startsWith("https") ? https : http;
       const expected = Number(expectedSize) || 0;
 
@@ -665,6 +816,7 @@ class SyncEngine extends EventEmitter {
           return;
         }
         if (res.statusCode !== 200) return fail(new Error(`HTTP ${res.statusCode}`));
+        res.on("error", fail);
         const total = Number(res.headers["content-length"]) || 0;
         let received = 0;
         res.on("data", (chunk) => {
@@ -683,7 +835,7 @@ class SyncEngine extends EventEmitter {
         });
         res.pipe(file);
         file.on("finish", () =>
-          file.close(() => {
+          file.close(async () => {
             try {
               // Task #2164 — integrity guard: verify the written byte count
               // against the expected size BEFORE promoting the temp file to its
@@ -703,6 +855,9 @@ class SyncEngine extends EventEmitter {
                   );
                 }
               }
+              if (beforePromote) await beforePromote();
+              if (!this.isLocalPathAvailable(destPath)) throw new Error("Project path changed during download");
+              if (fs.existsSync(destPath)) throw new Error("Local file appeared during download; refusing to overwrite");
               fs.renameSync(tmp, destPath);
               resolve();
             } catch (e) {
@@ -715,11 +870,12 @@ class SyncEngine extends EventEmitter {
       const fail = (err) => {
         try {
           file.destroy();
-          if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+          if (fs.existsSync(tmp) && fs.lstatSync(tmp).ino === tempIno) fs.unlinkSync(tmp);
         } catch (_) {}
         reject(err);
       };
 
+      file.on("error", fail);
       proto.get(url, onResponse).on("error", fail);
     });
   }
