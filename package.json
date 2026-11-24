@@ -1,12 +1,13 @@
 {
   "name": "em-desktop",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Editing Machine desktop shell — portal window + background file-sync daemon",
   "author": "Editing Machine",
   "main": "src/main/index.js",
   "scripts": {
     "dev:renderer": "vite",
     "dev": "concurrently \"npm:dev:renderer\" \"cross-env NODE_ENV=development electron .\"",
+    "verify:release-inputs": "node scripts/validate-release-inputs.cjs",
     "build:renderer": "vite build",
     "build": "npm run build:renderer && electron-builder",
     "build:win": "npm run build:renderer && electron-builder --win",
@@ -14,10 +15,12 @@
     "build:linux": "npm run build:renderer && electron-builder --linux"
   },
   "dependencies": {
+    "glob": "file:vendor/editingmachine-glob-compat-1.0.0.tgz",
+    "minimatch": "file:vendor/editingmachine-minimatch-compat-1.0.0.tgz",
     "auto-launch": "^5.0.6",
     "conf": "^10.2.0",
     "electron-updater": "^6.8.9",
-    "sprintf-js": "file:../vendor/editingmachine-bounded-sprintf-1.0.0.tgz"
+    "sprintf-js": "file:vendor/editingmachine-bounded-sprintf-1.0.0.tgz"
   },
   "devDependencies": {
     "@types/react": "^18.2.0",
@@ -39,7 +42,12 @@
     "sprintf-js": "$sprintf-js",
     "@xmldom/xmldom": "^0.8.15",
     "nanoid@^3": "^3.3.18",
-    "undici@^6": "^6.28.1",
+    "undici@^6": "^6.29.1",
+    "glob@<9": "$glob",
+    "glob@>=9": "^14.0.3",
+    "minimatch@<9": "$minimatch",
+    "minimatch@>=9": "^11.0.4",
+    "follow-redirects": "^1.16.2",
     "tar": "^7.5.19",
     "http-cache-semantics": "^4.3.0",
     "brace-expansion@^1": "^1.1.21",

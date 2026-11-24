@@ -46,8 +46,11 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Validate standalone release inputs
+        run: npm run verify:release-inputs
+
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build renderer
         run: npm run build:renderer
